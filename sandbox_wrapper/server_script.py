@@ -38,10 +38,10 @@ POOL_ROOT = SHARED_FOLDER / "_venv_pool"
 # drive-root path, so they're built relative to SHARED_FOLDER instead
 # of hardcoded.
 PYTHON_PATHS = {
-    "3.11": str(SHARED_FOLDER / "311" / "python.exe"),
-    "3.12": str(SHARED_FOLDER / "312" / "python.exe"),
-    "3.13": str(SHARED_FOLDER / "313" / "python.exe"),
-    "3.14": str(SHARED_FOLDER / "314" / "python.exe"),
+    "3.11": str(SHARED_FOLDER / "Python311" / "python.exe"),
+    "3.12": str(SHARED_FOLDER / "Python312" / "python.exe"),
+    "3.13": str(SHARED_FOLDER / "Python313" / "python.exe"),
+    "3.14": str(SHARED_FOLDER / "Python314" / "python.exe"),
 }
 
 # Injected from constants.py by manager.py
