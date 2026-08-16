@@ -1,10 +1,18 @@
 # server_script.py
 #
-# This module still just exports SERVER_PY, a string of the Python source
-# that gets written into the sandbox and run there. manager.py substitutes
-# the __PLACEHOLDER__ tokens below with values from constants.py before
-# writing the file (plain string.replace, NOT str.format — the dict
-# literals below use {} and would break .format()).
+# Exports SERVER_PY, the source that gets written into the sandbox and
+# run there. manager.py substitutes the __PLACEHOLDER__ tokens below
+# with values from constants.py using plain string.replace (NOT
+# str.format -- the dict literals here use {} and would break .format()).
+#
+# Protocol: instead of a single task.json/result.json pair (one task in
+# flight at a time), the host writes one file per task into tasks/, and
+# this server writes one file per result into results/, both named
+# <task_id>.json. Each incoming "run" task is handled on its own thread,
+# which blocks on the venv pool until a slot for the requested version
+# is free. That's what ties concurrency directly to pool size: N warm
+# venvs for a version means N "run" tasks for that version can be
+# in-flight at once; the (N+1)th just waits.
 
 SERVER_PY = '''
 import os
@@ -13,11 +21,12 @@ import subprocess
 import time
 import sys
 import shutil
+import threading
 from pathlib import Path
 
 SHARED_FOLDER = Path("C:/Shared")
-TASK_FILE = SHARED_FOLDER / "task.json"
-RESULT_FILE = SHARED_FOLDER / "result.json"
+TASKS_DIR = SHARED_FOLDER / "tasks"
+RESULTS_DIR = SHARED_FOLDER / "results"
 READY_FILE = SHARED_FOLDER / "ready.txt"
 
 TEMPLATE_ROOT = SHARED_FOLDER / "_venv_templates"
@@ -38,11 +47,9 @@ DEFAULT_VERSION = "__DEFAULT_VERSION__"
 
 
 def _robocopy_mirror(src, dst):
-    """Mirror src -> dst. Fast incremental sync: deletes files in dst
-    that aren't in src, copies new/changed files. Used both to clone a
-    pool slot from its template and to wipe a slot back to pristine
-    after a task finishes.
-
+    """Mirror src -> dst. Deletes files in dst not present in src,
+    copies new/changed files. Used to clone a pool slot from its
+    template, and to wipe a slot back to pristine after a task finishes.
     robocopy's "success" exit codes are 0-7, not just 0, so we don't
     check=True here.
     """
@@ -62,24 +69,30 @@ class VenvSlot:
         self.version = version
         self.index = index
         self.busy = False
+        self.marked_for_removal = False
 
 
 class VenvPool:
-    """Manages a reusable pool of venvs per Python version.
+    """Manages a reusable pool of venvs per Python version, and gates
+    concurrency on it: acquire() blocks until a slot is free, so at most
+    len(pool) "run" tasks for a version execute at the same time.
 
-    Instead of `python -m venv` + `shutil.rmtree` on every single task
-    (slow: venv creation runs ensurepip every time), each version gets
-    one pristine "template" venv built once. Pool slots are cheap
-    robocopy clones of that template. When a task finishes, the slot is
-    wiped back to pristine by robocopy-mirroring the template over it
-    again -- this removes anything pip installed and reverts any files
-    the task's code touched, without paying the ensurepip cost.
+    grow()/shrink() change that ceiling live:
+      - grow() adds slots and wakes any threads waiting in acquire().
+      - shrink() removes idle slots immediately; if it's asked to
+        remove more than are currently idle, the remaining busy slots
+        are flagged and get torn down (not recycled) the moment their
+        current task finishes -- so the ceiling actually drops instead
+        of quietly staying the same until someone happens to need fewer
+        slots.
     """
 
     def __init__(self, python_paths, pool_size):
         self.python_paths = python_paths
         self.pool_size = pool_size
-        self.pools = {}  # version -> list[VenvSlot]
+        self.pools = {}       # version -> list[VenvSlot]
+        self._building = set()  # versions currently having their template/pool built
+        self.cond = threading.Condition()
         TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
         POOL_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -87,6 +100,8 @@ class VenvPool:
         return TEMPLATE_ROOT / f"template_{version}"
 
     def _ensure_template(self, version):
+        """Build the one-time template venv for a version, if it isn't
+        already there. Slow (runs ensurepip) but only happens once."""
         template_dir = self._template_dir(version)
         marker = template_dir / "Scripts" / "python.exe"
         if marker.exists():
@@ -109,84 +124,122 @@ class VenvPool:
         _robocopy_mirror(template_dir, slot_dir)
         return VenvSlot(slot_dir, version, index)
 
-    def grow(self, version, by):
-        """Add `by` more slots to this version's pool, ignoring the
-        VENV_POOL_SIZE cap -- this is the explicit "make more venvs on
-        the go" path.
+    def ensure_pool(self, version, size=None):
+        """Make sure `version` has at least `size` (default
+        VENV_POOL_SIZE) slots. Safe to call from multiple threads for
+        the same brand-new version -- only one of them actually builds.
         """
-        template_dir = self._ensure_template(version)
-        slots = self.pools.setdefault(version, [])
-        start = len(slots)
-        for i in range(by):
-            slots.append(self._new_slot(version, template_dir, start + i))
-        return len(slots)
+        size = self.pool_size if size is None else size
+
+        with self.cond:
+            while version in self._building:
+                self.cond.wait()
+            slots = self.pools.get(version, [])
+            if len(slots) >= size:
+                return len(slots)
+            self._building.add(version)
+
+        try:
+            template_dir = self._ensure_template(version)  # slow, outside lock
+            with self.cond:
+                start = len(self.pools.get(version, []))
+                need = max(0, size - start)
+            new_slots = [self._new_slot(version, template_dir, start + i) for i in range(need)]
+            with self.cond:
+                self.pools.setdefault(version, []).extend(new_slots)
+                return len(self.pools[version])
+        finally:
+            with self.cond:
+                self._building.discard(version)
+                self.cond.notify_all()
+
+    def grow(self, version, by):
+        """Explicitly add `by` slots on top of whatever's there now --
+        raises the concurrency ceiling for this version immediately."""
+        current = len(self.pools.get(version, []))
+        total = self.ensure_pool(version, size=current + by)
+        with self.cond:
+            self.cond.notify_all()
+        return total
 
     def shrink(self, version, by):
-        """Remove up to `by` idle slots from the end of the pool.
-        Busy slots are never removed.
-        """
-        slots = self.pools.get(version, [])
-        removed = 0
-        i = len(slots) - 1
-        while i >= 0 and removed < by:
-            if not slots[i].busy:
-                shutil.rmtree(slots[i].path, ignore_errors=True)
-                slots.pop(i)
-                removed += 1
-            i -= 1
-        return removed
+        """Lower the concurrency ceiling for `version` by up to `by`.
+        Idle slots are deleted right away. If there aren't enough idle
+        slots, busy ones are flagged and torn down as soon as they
+        finish instead of being reset back into the pool."""
+        with self.cond:
+            slots = self.pools.get(version, [])
+            removed = 0
+            i = len(slots) - 1
+            while i >= 0 and removed < by:
+                if not slots[i].busy:
+                    shutil.rmtree(slots[i].path, ignore_errors=True)
+                    slots.pop(i)
+                    removed += 1
+                i -= 1
+            still_needed = by - removed
+            if still_needed > 0:
+                flagged = 0
+                for slot in slots:
+                    if flagged >= still_needed:
+                        break
+                    if slot.busy and not slot.marked_for_removal:
+                        slot.marked_for_removal = True
+                        flagged += 1
+            return removed
 
-    def ensure_pool(self, version, size=None):
-        size = self.pool_size if size is None else size
-        slots = self.pools.setdefault(version, [])
-        if len(slots) < size:
-            self.grow(version, size - len(slots))
-        return len(self.pools[version])
+    def acquire(self, version, timeout=None):
+        """Block until a venv slot for `version` is free, then claim it.
+        This is the concurrency gate: with a pool of N slots, at most N
+        callers hold a slot at once; the rest wait here."""
+        if version not in self.pools:
+            self.ensure_pool(version)
 
-    def acquire(self, version):
-        template_dir = self._ensure_template(version)
-        slots = self.pools.setdefault(version, [])
-        for slot in slots:
-            if not slot.busy:
-                slot.busy = True
-                return slot
-        if len(slots) < self.pool_size:
-            slot = self._new_slot(version, template_dir, len(slots))
-            slots.append(slot)
-            slot.busy = True
-            return slot
-        # Pool is at cap and every slot shows busy. In the normal
-        # single-task-at-a-time flow this only happens if a previous
-        # task crashed without releasing its slot. Recover by reusing
-        # the first slot rather than hanging forever.
-        slot = slots[0]
-        _robocopy_mirror(template_dir, slot.path)
-        slot.busy = True
-        return slot
+        start = time.time()
+        with self.cond:
+            while True:
+                for slot in self.pools.get(version, []):
+                    if not slot.busy and not slot.marked_for_removal:
+                        slot.busy = True
+                        return slot
+                if timeout is not None and time.time() - start > timeout:
+                    raise TimeoutError(f"Timed out waiting for a free venv for {version}")
+                self.cond.wait(timeout=1.0)
 
     def release(self, slot):
+        """Return a slot after use. If it was flagged for removal
+        (via shrink()) it's torn down instead of recycled -- that's how
+        the concurrency ceiling actually drops. Otherwise it's wiped
+        back to pristine and made available again."""
+        with self.cond:
+            if slot.marked_for_removal:
+                self.pools[slot.version].remove(slot)
+                shutil.rmtree(slot.path, ignore_errors=True)
+                self.cond.notify_all()
+                return
         template_dir = self._template_dir(slot.version)
         _robocopy_mirror(template_dir, slot.path)
-        slot.busy = False
+        with self.cond:
+            slot.busy = False
+            self.cond.notify_all()
 
     def status(self):
-        return {
-            version: {
-                "total": len(slots),
-                "busy": sum(1 for s in slots if s.busy),
-                "idle": sum(1 for s in slots if not s.busy),
+        with self.cond:
+            return {
+                version: {
+                    "total": len(slots),
+                    "busy": sum(1 for s in slots if s.busy),
+                    "idle": sum(1 for s in slots if not s.busy),
+                }
+                for version, slots in self.pools.items()
             }
-            for version, slots in self.pools.items()
-        }
 
 
-def execute_python_code(pool, code, version):
-    """Run code using a venv checked out from the pool, then wipe and
-    return that venv to the pool instead of deleting it."""
+def execute_python_code(pool, code, version, acquire_timeout):
     if version not in PYTHON_PATHS:
         return {"error": f"Unknown Python version: {version}"}
     try:
-        slot = pool.acquire(version)
+        slot = pool.acquire(version, timeout=acquire_timeout)
     except Exception as e:
         return {"error": f"Could not acquire venv: {e}"}
     try:
@@ -214,7 +267,8 @@ def handle_task(pool, task):
     if action == "run":
         code = task.get("code", "")
         version = task.get("version", DEFAULT_VERSION)
-        return execute_python_code(pool, code, version)
+        acquire_timeout = task.get("acquire_timeout", 120)
+        return execute_python_code(pool, code, version, acquire_timeout)
 
     if action == "create_venv":
         version = task.get("version", DEFAULT_VERSION)
@@ -229,7 +283,7 @@ def handle_task(pool, task):
         version = task.get("version", DEFAULT_VERSION)
         count = int(task.get("count", 1))
         removed = pool.shrink(version, count)
-        return {"ok": True, "version": version, "removed": removed}
+        return {"ok": True, "version": version, "removed_now": removed}
 
     if action == "status":
         return {"ok": True, "pools": pool.status()}
@@ -237,8 +291,19 @@ def handle_task(pool, task):
     return {"error": f"Unknown action: {action}"}
 
 
+def process_task(pool, task_id, task):
+    try:
+        result = handle_task(pool, task)
+    except Exception as e:
+        result = {"error": f"Server error: {e}"}
+    (RESULTS_DIR / f"{task_id}.json").write_text(json.dumps(result), encoding="utf-8")
+
+
 def main():
     SHARED_FOLDER.mkdir(parents=True, exist_ok=True)
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
     pool = VenvPool(PYTHON_PATHS, VENV_POOL_SIZE)
 
     for version in PREWARM_VERSIONS:
@@ -249,23 +314,29 @@ def main():
             print(f"Failed to pre-warm pool for {version}: {e}")
 
     READY_FILE.write_text("ready")
-    print(f"Server ready. Watching {TASK_FILE}...")
+    print(f"Server ready. Watching {TASKS_DIR} (concurrency = venv pool size per version)...")
 
     while True:
-        if TASK_FILE.exists():
+        for task_path in sorted(TASKS_DIR.glob("*.json")):
+            # Read + delete happens synchronously here, on the single
+            # polling thread, BEFORE spawning a worker -- that's what
+            # guarantees a task file is never picked up twice even
+            # though the next glob() runs again in 0.2s. The actual
+            # work (including waiting on the venv pool) happens on its
+            # own thread so slow/queued tasks don't block discovery.
+            task_id = task_path.stem
             try:
-                with open(TASK_FILE, "r") as f:
-                    task = json.load(f)
-                result = handle_task(pool, task)
-                with open(RESULT_FILE, "w") as f:
-                    json.dump(result, f)
-                TASK_FILE.unlink()
+                task = json.loads(task_path.read_text(encoding="utf-8"))
             except Exception as e:
-                with open(RESULT_FILE, "w") as f:
-                    json.dump({"error": f"Server error: {str(e)}"}, f)
-                if TASK_FILE.exists():
-                    TASK_FILE.unlink()
-        time.sleep(0.5)
+                task_path.unlink(missing_ok=True)
+                (RESULTS_DIR / f"{task_id}.json").write_text(
+                    json.dumps({"error": f"Bad task file: {e}"}), encoding="utf-8"
+                )
+                continue
+            task_path.unlink(missing_ok=True)
+            t = threading.Thread(target=process_task, args=(pool, task_id, task), daemon=True)
+            t.start()
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":
