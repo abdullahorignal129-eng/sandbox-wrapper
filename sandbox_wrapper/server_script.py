@@ -32,12 +32,16 @@ READY_FILE = SHARED_FOLDER / "ready.txt"
 TEMPLATE_ROOT = SHARED_FOLDER / "_venv_templates"
 POOL_ROOT = SHARED_FOLDER / "_venv_pool"
 
-# Map version strings to sandbox Python paths
+# Map version strings to sandbox Python paths. These interpreters now
+# live inside the shared folder itself (e.g. host F:\Abdullah\Codes\
+# Dataset\Shared\312 -> C:/Shared/312 in the sandbox), not at a fixed
+# drive-root path, so they're built relative to SHARED_FOLDER instead
+# of hardcoded.
 PYTHON_PATHS = {
-    "3.11": "C:/Python311/python.exe",
-    "3.12": "C:/Python312/python.exe",
-    "3.13": "C:/Python313/python.exe",
-    "3.14": "C:/Python314/python.exe",
+    "3.11": str(SHARED_FOLDER / "311" / "python.exe"),
+    "3.12": str(SHARED_FOLDER / "312" / "python.exe"),
+    "3.13": str(SHARED_FOLDER / "313" / "python.exe"),
+    "3.14": str(SHARED_FOLDER / "314" / "python.exe"),
 }
 
 # Injected from constants.py by manager.py
