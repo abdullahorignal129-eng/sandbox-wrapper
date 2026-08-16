@@ -1,14 +1,14 @@
-# wsb_template.py - Windows Sandbox configuration XML template
+# wsb_template.py
 WSB_TEMPLATE = '''\
 <Configuration>
   <Networking>Enable</Networking>
   <MappedFolder>
     <HostFolder>{host_folder}</HostFolder>
-    <SandboxFolder>{sandbox_folder}</SandboxFolder>
+    <SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\Shared</SandboxFolder>
     <ReadOnly>false</ReadOnly>
   </MappedFolder>
   <LogonCommand>
-    <Command>cmd /c python {sandbox_folder}\\server.py</Command>
+    <Command>cmd /c python C:\Users\WDAGUtilityAccount\Desktop\Shared\server.py</Command>
   </LogonCommand>
 </Configuration>
 '''
