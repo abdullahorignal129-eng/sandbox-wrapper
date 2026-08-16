@@ -1,44 +1,17 @@
 WSB_TEMPLATE = r'''<Configuration>
     <Networking>Enable</Networking>
     <MappedFolders>
-        <!-- Shared folder (writable, for communication) -->
+        <!-- Shared folder (writable, for communication, AND holds the -->
+        <!-- manually-copied Python installs + persistent/throwaway venvs) -->
         <MappedFolder>
             <HostFolder>{host_folder}</HostFolder>
             <SandboxFolder>C:\Shared</SandboxFolder>
             <ReadOnly>false</ReadOnly>
         </MappedFolder>
-
-        <!-- Python 3.11 (read-only) -->
-        <MappedFolder>
-            <HostFolder>F:\Apps\Dev\Python\311</HostFolder>
-            <SandboxFolder>C:\Python311</SandboxFolder>
-            <ReadOnly>true</ReadOnly>
-        </MappedFolder>
-
-        <!-- Python 3.12 (read-only) -->
-        <MappedFolder>
-            <HostFolder>F:\Apps\Dev\Python\312</HostFolder>
-            <SandboxFolder>C:\Python312</SandboxFolder>
-            <ReadOnly>true</ReadOnly>
-        </MappedFolder>
-
-        <!-- Python 3.13 (read-only) -->
-        <MappedFolder>
-            <HostFolder>F:\Apps\Dev\Python\313</HostFolder>
-            <SandboxFolder>C:\Python313</SandboxFolder>
-            <ReadOnly>true</ReadOnly>
-        </MappedFolder>
-
-        <!-- Python 3.14 (read-only) -->
-        <MappedFolder>
-            <HostFolder>F:\Apps\Dev\Python\314</HostFolder>
-            <SandboxFolder>C:\Python314</SandboxFolder>
-            <ReadOnly>true</ReadOnly>
-        </MappedFolder>
     </MappedFolders>
 
     <LogonCommand>
-        <Command>cmd /c C:\Python312\python.exe -u C:\Shared\server.py &gt; C:\Shared\server.log 2&gt;&amp;1</Command>
+        <Command>cmd /c C:\Shared\Python312\python.exe -u C:\Shared\server.py &gt; C:\Shared\server.log 2&gt;&amp;1</Command>
     </LogonCommand>
 </Configuration>
 '''
