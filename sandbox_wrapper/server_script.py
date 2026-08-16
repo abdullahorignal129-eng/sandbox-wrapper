@@ -8,8 +8,8 @@ import sys
 import shutil
 from pathlib import Path
 
-# The shared folder path inside the sandbox (must match the .wsb mapping)
-SHARED_FOLDER = Path(r"G:\\Archnemix\\Dataset\\Shared")
+# The shared folder path inside the sandbox (now on the Desktop)
+SHARED_FOLDER = Path(r"C:\Users\WDAGUtilityAccount\Desktop\Shared")
 TASK_FILE = SHARED_FOLDER / "task.json"
 RESULT_FILE = SHARED_FOLDER / "result.json"
 READY_FILE = SHARED_FOLDER / "ready.txt"
@@ -42,6 +42,9 @@ def execute_python_code(code, version):
             shutil.rmtree(venv_dir, ignore_errors=True)
 
 def main():
+    # Ensure the Shared folder exists on the desktop
+    SHARED_FOLDER.mkdir(parents=True, exist_ok=True)
+    
     # Write ready signal
     READY_FILE.write_text("ready")
     print(f"Server ready. Watching {TASK_FILE}...")
