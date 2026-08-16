@@ -22,6 +22,7 @@ import time
 import sys
 import shutil
 import threading
+import queue
 from pathlib import Path
 
 SHARED_FOLDER = Path("C:/Shared")
@@ -72,7 +73,8 @@ class VenvSlot:
         self.path = path
         self.version = version
         self.index = index
-        self.busy = False
+        self.busy = False          # currently running a task
+        self.dirty = False         # needs cleaning (queued for wipe)
         self.marked_for_removal = False
 
 
@@ -81,24 +83,41 @@ class VenvPool:
     concurrency on it: acquire() blocks until a slot is free, so at most
     len(pool) "run" tasks for a version execute at the same time.
 
-    grow()/shrink() change that ceiling live:
-      - grow() adds slots and wakes any threads waiting in acquire().
-      - shrink() removes idle slots immediately; if it's asked to
-        remove more than are currently idle, the remaining busy slots
-        are flagged and get torn down (not recycled) the moment their
-        current task finishes -- so the ceiling actually drops instead
-        of quietly staying the same until someone happens to need fewer
-        slots.
+    Cleaning (the slow robocopy) is done asynchronously in a background
+    thread so the pool lock is never held for a long time.
     """
 
     def __init__(self, python_paths, pool_size):
         self.python_paths = python_paths
         self.pool_size = pool_size
-        self.pools = {}       # version -> list[VenvSlot]
-        self._building = set()  # versions currently having their template/pool built
+        self.pools = {}          # version -> list[VenvSlot]
+        self._building = set()
         self.cond = threading.Condition()
+        self.clean_queue = queue.Queue()
+        self.clean_thread = threading.Thread(target=self._cleaner, daemon=True)
+        self.clean_thread.start()
         TEMPLATE_ROOT.mkdir(parents=True, exist_ok=True)
         POOL_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def _cleaner(self):
+        """Background thread: takes dirty slots, wipes them, then marks idle."""
+        while True:
+            slot = self.clean_queue.get()
+            try:
+                template_dir = self._template_dir(slot.version)
+                _robocopy_mirror(template_dir, slot.path)
+            except Exception as e:
+                # If wipe fails, delete the slot to avoid pollution.
+                print(f"Clean failed for {slot.path}: {e}")
+                with self.cond:
+                    if slot in self.pools.get(slot.version, []):
+                        self.pools[slot.version].remove(slot)
+                    shutil.rmtree(slot.path, ignore_errors=True)
+            finally:
+                with self.cond:
+                    slot.dirty = False
+                    slot.busy = False
+                    self.cond.notify_all()
 
     def _template_dir(self, version):
         return TEMPLATE_ROOT / f"template_{version}"
@@ -170,14 +189,18 @@ class VenvPool:
         """Lower the concurrency ceiling for `version` by up to `by`.
         Idle slots are deleted right away. If there aren't enough idle
         slots, busy ones are flagged and torn down as soon as they
-        finish instead of being reset back into the pool."""
+        finish instead of being reset back into the pool.
+        """
         with self.cond:
             slots = self.pools.get(version, [])
             removed = 0
             i = len(slots) - 1
             while i >= 0 and removed < by:
-                if not slots[i].busy:
-                    shutil.rmtree(slots[i].path, ignore_errors=True)
+                slot = slots[i]
+                # Can remove if not busy (including dirty or idle)
+                if not slot.busy:
+                    # If it's dirty, it's in the queue – we can remove it now.
+                    shutil.rmtree(slot.path, ignore_errors=True)
                     slots.pop(i)
                     removed += 1
                 i -= 1
@@ -195,7 +218,8 @@ class VenvPool:
     def acquire(self, version, timeout=None):
         """Block until a venv slot for `version` is free, then claim it.
         This is the concurrency gate: with a pool of N slots, at most N
-        callers hold a slot at once; the rest wait here."""
+        callers hold a slot at once; the rest wait here.
+        """
         if version not in self.pools:
             self.ensure_pool(version)
 
@@ -203,7 +227,7 @@ class VenvPool:
         with self.cond:
             while True:
                 for slot in self.pools.get(version, []):
-                    if not slot.busy and not slot.marked_for_removal:
+                    if not slot.busy and not slot.dirty and not slot.marked_for_removal:
                         slot.busy = True
                         return slot
                 if timeout is not None and time.time() - start > timeout:
@@ -211,21 +235,19 @@ class VenvPool:
                 self.cond.wait(timeout=1.0)
 
     def release(self, slot):
-        """Return a slot after use. If it was flagged for removal
-        (via shrink()) it's torn down instead of recycled -- that's how
-        the concurrency ceiling actually drops. Otherwise it's wiped
-        back to pristine and made available again."""
+        """Called after task finishes. Mark slot as dirty and enqueue for cleaning."""
         with self.cond:
+            slot.busy = False
+            # If marked for removal, delete it instead of cleaning.
             if slot.marked_for_removal:
                 self.pools[slot.version].remove(slot)
                 shutil.rmtree(slot.path, ignore_errors=True)
                 self.cond.notify_all()
                 return
-        template_dir = self._template_dir(slot.version)
-        _robocopy_mirror(template_dir, slot.path)
-        with self.cond:
-            slot.busy = False
-            self.cond.notify_all()
+            slot.dirty = True
+        # Enqueue for background cleaning (lock is released here)
+        self.clean_queue.put(slot)
+        # Do NOT notify waiters here; they'll be notified when cleaner finishes.
 
     def status(self):
         with self.cond:
@@ -233,7 +255,8 @@ class VenvPool:
                 version: {
                     "total": len(slots),
                     "busy": sum(1 for s in slots if s.busy),
-                    "idle": sum(1 for s in slots if not s.busy),
+                    "idle": sum(1 for s in slots if not s.busy and not s.dirty),
+                    "dirty": sum(1 for s in slots if s.dirty),
                 }
                 for version, slots in self.pools.items()
             }
@@ -322,12 +345,6 @@ def main():
 
     while True:
         for task_path in sorted(TASKS_DIR.glob("*.json")):
-            # Read + delete happens synchronously here, on the single
-            # polling thread, BEFORE spawning a worker -- that's what
-            # guarantees a task file is never picked up twice even
-            # though the next glob() runs again in 0.2s. The actual
-            # work (including waiting on the venv pool) happens on its
-            # own thread so slow/queued tasks don't block discovery.
             task_id = task_path.stem
             try:
                 task = json.loads(task_path.read_text(encoding="utf-8"))
