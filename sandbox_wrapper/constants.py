@@ -3,7 +3,7 @@ from pathlib import Path
 DEFAULT_SHARED_FOLDER = Path(r"F:\Abdullah\Codes\Dataset\Shared")
 DEFAULT_WSB_FOLDER = Path(r"F:\Abdullah\Codes\Dataset")
 
-SERVER_START_TIMEOUT = 180  # seconds
+SERVER_START_TIMEOUT = 300 # seconds
 TASK_TIMEOUT = 120
 POLL_INTERVAL = 0.5
 
