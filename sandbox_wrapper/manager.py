@@ -13,7 +13,6 @@ from .constants import (
     SERVER_START_TIMEOUT,
     TASK_TIMEOUT,
     POLL_INTERVAL,
-    PYTHON_SOURCE_PATHS,
 )
 from .server_script import SERVER_PY
 from .wsb_template import WSB_TEMPLATE
@@ -32,12 +31,10 @@ class SandboxManager:
         self.result_file = self.shared_folder / "result.json"
         self.ready_file = self.shared_folder / "ready.txt"
         self.server_script_file = self.shared_folder / "server.py"
-        self.python_versions_dir = self.shared_folder / "Python_versions"
 
         self._sandbox_process = None
         self._ensure_folders()
         self._prepare_files()
-        self._copy_python_versions()   # copies all four versions
 
     def _ensure_folders(self):
         self.shared_folder.mkdir(parents=True, exist_ok=True)
@@ -69,6 +66,10 @@ class SandboxManager:
         start = time.time()
         while not self._is_sandbox_ready():
             if time.time() - start > timeout:
+                # Check if there's a server.log file for debugging
+                log_file = self.shared_folder / "server.log"
+                if log_file.exists():
+                    print(f"Server log:\n{log_file.read_text(encoding='utf-8')}")
                 raise TimeoutError("Sandbox did not become ready in time.")
             time.sleep(POLL_INTERVAL)
         print("Sandbox is ready.")
@@ -76,11 +77,6 @@ class SandboxManager:
     def run_code(self, code: str, version: str = "3.12") -> Dict[str, Any]:
         if not self._is_sandbox_ready():
             raise RuntimeError("Sandbox is not ready. Call .launch() first.")
-
-        # Validate that the requested version is available
-        version_dir = self.python_versions_dir / version
-        if not (version_dir / "python.exe").exists():
-            raise ValueError(f"Python version {version} not available in sandbox.")
 
         # Clean up stale files
         if self.task_file.exists():
