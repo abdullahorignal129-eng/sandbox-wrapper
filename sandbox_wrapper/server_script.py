@@ -11,19 +11,28 @@ SHARED_FOLDER = Path("C:/Users/WDAGUtilityAccount/Desktop/Shared")
 TASK_FILE = SHARED_FOLDER / "task.json"
 RESULT_FILE = SHARED_FOLDER / "result.json"
 READY_FILE = SHARED_FOLDER / "ready.txt"
-PYTHON_VERSIONS_DIR = SHARED_FOLDER / "Python_versions"
+
+# Map version strings to sandbox Python paths
+PYTHON_PATHS = {
+    "3.11": "C:/Python311/python.exe",
+    "3.12": "C:/Python312/python.exe",
+    "3.13": "C:/Python313/python.exe",
+    "3.14": "C:/Python314/python.exe",
+}
 
 def execute_python_code(code, version):
     """Execute Python code using the specified version."""
-    # Path to the correct python.exe
-    python_exe = PYTHON_VERSIONS_DIR / version / "python.exe"
-    if not python_exe.exists():
-        return {"error": f"Python version {version} not found at {python_exe}"}
+    python_exe = PYTHON_PATHS.get(version)
+    if not python_exe:
+        return {"error": f"Unknown Python version: {version}"}
+    
+    if not Path(python_exe).exists():
+        return {"error": f"Python {version} not found at {python_exe}"}
 
     # Create temporary venv using this version
     venv_dir = SHARED_FOLDER / f"venv_{version}_{int(time.time())}"
     try:
-        subprocess.run([str(python_exe), "-m", "venv", str(venv_dir)],
+        subprocess.run([python_exe, "-m", "venv", str(venv_dir)],
                        check=True, capture_output=True)
         venv_python = venv_dir / "Scripts" / "python.exe"
         result = subprocess.run([str(venv_python), "-c", code],
