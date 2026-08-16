@@ -5,7 +5,7 @@ import time
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from .constants import (
     DEFAULT_SHARED_FOLDER,
@@ -31,8 +31,8 @@ class SandboxManager:
         self.result_file = self.shared_folder / "result.json"
         self.ready_file = self.shared_folder / "ready.txt"
         self.server_script_file = self.shared_folder / "server.py"
-
         self._sandbox_process = None
+
         self._ensure_folders()
         self._prepare_files()
 
@@ -72,9 +72,27 @@ class SandboxManager:
                     print(f"Server log:\n{log_file.read_text(encoding='utf-8')}")
                 raise TimeoutError("Sandbox did not become ready in time.")
             time.sleep(POLL_INTERVAL)
+
         print("Sandbox is ready.")
 
-    def run_code(self, code: str, version: str = "3.12") -> Dict[str, Any]:
+    def run_code(
+        self,
+        code: str,
+        version: str = "3.12",
+        packages: Optional[List[str]] = None,
+        env_id: Optional[str] = None,
+        timeout: int = TASK_TIMEOUT,
+    ) -> Dict[str, Any]:
+        """
+        Run code inside the sandbox.
+
+        packages: list of pip package specs to install before running
+                  (e.g. ["requests", "pandas==2.2.0"]).
+        env_id:   if given, reuse/create a persistent venv named env_id under
+                  C:\\Shared\\envs\\<env_id> -- installed packages persist
+                  across calls with the same env_id. If omitted, a fresh
+                  throwaway venv is created and deleted after this call.
+        """
         if not self._is_sandbox_ready():
             raise RuntimeError("Sandbox is not ready. Call .launch() first.")
 
@@ -85,14 +103,19 @@ class SandboxManager:
             self.result_file.unlink()
 
         # Write task
-        task = {"code": code, "version": version}
+        task = {
+            "code": code,
+            "version": version,
+            "packages": packages or [],
+            "env_id": env_id,
+        }
         self.task_file.write_text(json.dumps(task), encoding='utf-8')
 
         # Wait for result
         start = time.time()
         while not self.result_file.exists():
-            if time.time() - start > TASK_TIMEOUT:
-                raise TimeoutError(f"Task did not complete within {TASK_TIMEOUT}s.")
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Task did not complete within {timeout}s.")
             time.sleep(POLL_INTERVAL)
 
         result = json.loads(self.result_file.read_text(encoding='utf-8'))
