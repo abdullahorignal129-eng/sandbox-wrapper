@@ -1,7 +1,7 @@
 from pathlib import Path
 
-DEFAULT_SHARED_FOLDER = Path(r"G:\Archnemix\Dataset\Shared")
-DEFAULT_WSB_FOLDER = Path(r"G:\Archnemix\Dataset")
+DEFAULT_SHARED_FOLDER = Path(r"F:\Abdullah\Codes\Dataset\Shared")
+DEFAULT_WSB_FOLDER = Path(r"F:\Abdullah\Codes\Dataset")
 
 SERVER_START_TIMEOUT = 180  # seconds
 TASK_TIMEOUT = 120
