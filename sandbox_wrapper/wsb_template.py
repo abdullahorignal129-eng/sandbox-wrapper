@@ -1,5 +1,4 @@
-WSB_TEMPLATE = r'''
-<Configuration>
+WSB_TEMPLATE = r'''<Configuration>
     <Networking>Enable</Networking>
     <MappedFolders>
         <!-- Shared folder (writable, for communication) -->
@@ -39,7 +38,7 @@ WSB_TEMPLATE = r'''
     </MappedFolders>
 
     <LogonCommand>
-        <Command>cmd /c C:\Python312\python.exe C:\Shared\server.py &gt; C:\Shared\server.log 2&gt;&amp;1</Command>
+        <Command>cmd /c C:\Python312\python.exe -u C:\Shared\server.py &gt; C:\Shared\server.log 2&gt;&amp;1</Command>
     </LogonCommand>
 </Configuration>
 '''
