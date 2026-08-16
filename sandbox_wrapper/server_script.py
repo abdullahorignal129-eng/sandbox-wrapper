@@ -1,5 +1,5 @@
 # server_script.py - The Python code that runs INSIDE the sandbox
-SERVER_PY = '''\
+SERVER_PY = r'''
 import os
 import json
 import subprocess
