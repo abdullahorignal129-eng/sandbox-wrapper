@@ -7,7 +7,7 @@ import sys
 import shutil
 from pathlib import Path
 
-SHARED_FOLDER = Path("C:/Users/WDAGUtilityAccount/Desktop/Shared")
+SHARED_FOLDER = Path("C:/Shared")
 TASK_FILE = SHARED_FOLDER / "task.json"
 RESULT_FILE = SHARED_FOLDER / "result.json"
 READY_FILE = SHARED_FOLDER / "ready.txt"
@@ -25,7 +25,6 @@ def execute_python_code(code, version):
     python_exe = PYTHON_PATHS.get(version)
     if not python_exe:
         return {"error": f"Unknown Python version: {version}"}
-    
     if not Path(python_exe).exists():
         return {"error": f"Python {version} not found at {python_exe}"}
 
