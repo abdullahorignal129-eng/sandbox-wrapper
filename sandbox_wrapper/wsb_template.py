@@ -8,7 +8,7 @@ WSB_TEMPLATE = '''\
     <ReadOnly>false</ReadOnly>
   </MappedFolder>
   <LogonCommand>
-    <Command>cmd /c python C:/Users/WDAGUtilityAccount/Desktop/Shared/server.py</Command>
+    <Command>cmd /c C:/Users/WDAGUtilityAccount/Desktop/Shared/Python_versions/312/python.exe C:/Users/WDAGUtilityAccount/Desktop/Shared/server.py</Command>
   </LogonCommand>
 </Configuration>
 '''
