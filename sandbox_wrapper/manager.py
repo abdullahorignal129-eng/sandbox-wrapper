@@ -49,7 +49,7 @@ class SandboxManager:
         self.wsb_file.write_text(wsb_content, encoding='utf-8')
 
     def _copy_python_versions(self):
-        """Copy all Python installations from host to the shared folder."""
+        """Copy Python installations using Windows robocopy for speed."""
         for version, src_path in PYTHON_SOURCE_PATHS.items():
             dest_path = self.python_versions_dir / version
             if dest_path.exists() and (dest_path / "python.exe").exists():
@@ -58,12 +58,22 @@ class SandboxManager:
             if not src_path.exists():
                 print(f"Warning: Source Python {version} not found at {src_path}")
                 continue
+    
             print(f"Copying Python {version} from {src_path} to {dest_path}...")
-            shutil.copytree(
-                src_path,
-                dest_path,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
-            )
+            # /E: Copy subdirectories, including empty ones.
+            # /MT: Use multithreading for faster copying (default is 8 threads).
+            # /NDL: No directory logging.
+            # /NFL: No file logging.
+            # /NJH: No job header.
+            # /NJS: No job summary.
+            cmd = [
+                "robocopy", str(src_path), str(dest_path),
+                "/E", "/MT", "/NDL", "/NFL", "/NJH", "/NJS"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            # robocopy returns 0-7 depending on what happened; we'll check if it succeeded.
+            if result.returncode >= 8:
+                print(f"Error copying Python {version}: {result.stderr}")
 
     def _is_sandbox_ready(self) -> bool:
         return self.ready_file.exists()
