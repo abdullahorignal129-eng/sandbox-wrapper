@@ -1,4 +1,4 @@
-WSB_TEMPLATE = r'''\
+WSB_TEMPLATE = r'''
 <Configuration>
     <Networking>Enable</Networking>
     <MappedFolders>
