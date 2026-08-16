@@ -1,4 +1,3 @@
-# server_script.py - The Python code that runs INSIDE the sandbox
 SERVER_PY = '''
 import os
 import json
@@ -12,15 +11,22 @@ SHARED_FOLDER = Path("C:/Users/WDAGUtilityAccount/Desktop/Shared")
 TASK_FILE = SHARED_FOLDER / "task.json"
 RESULT_FILE = SHARED_FOLDER / "result.json"
 READY_FILE = SHARED_FOLDER / "ready.txt"
+PYTHON_VERSIONS_DIR = SHARED_FOLDER / "Python_versions"
 
 def execute_python_code(code, version):
-    """Execute Python code using the specified version and return the result."""
+    """Execute Python code using the specified version."""
+    # Path to the correct python.exe
+    python_exe = PYTHON_VERSIONS_DIR / version / "python.exe"
+    if not python_exe.exists():
+        return {"error": f"Python version {version} not found at {python_exe}"}
+
+    # Create temporary venv using this version
     venv_dir = SHARED_FOLDER / f"venv_{version}_{int(time.time())}"
     try:
-        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], 
+        subprocess.run([str(python_exe), "-m", "venv", str(venv_dir)],
                        check=True, capture_output=True)
-        python_exe = venv_dir / "Scripts" / "python.exe"
-        result = subprocess.run([str(python_exe), "-c", code], 
+        venv_python = venv_dir / "Scripts" / "python.exe"
+        result = subprocess.run([str(venv_python), "-c", code],
                                 capture_output=True, text=True, timeout=120)
         return {
             "stdout": result.stdout,
