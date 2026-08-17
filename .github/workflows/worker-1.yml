@@ -1,6 +1,8 @@
 name: Worker 1
 
 on:
+  schedule:
+    - cron: '0 */5 * * *'   # every 5 hours
   workflow_dispatch:
 
 concurrency:
@@ -9,7 +11,7 @@ concurrency:
 
 jobs:
   worker:
-    runs-on: windows-2025   # PINNED - do not use windows-latest
+    runs-on: windows-2025   # PINNED – do not use windows-latest
     timeout-minutes: 360
     env:
       WORKER_ID: 1
@@ -18,7 +20,7 @@ jobs:
       RUNNER_LABEL: "windows-2025"
       COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
       GITHUB_SHARED_SECRET: ${{ secrets.GITHUB_SHARED_SECRET }}
-      WORKFLOW_TRIGGER_PAT: ${{ secrets.WORKFLOW_TRIGGER_PAT }}
+      STOP_POLLING_AFTER_SECONDS: "17700"   # 4h55m
 
     steps:
       - uses: actions/checkout@v4
@@ -41,4 +43,4 @@ jobs:
       - name: Run worker agent
         shell: pwsh
         run: |
-          python agent.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }} --workflow-name worker-1.yml
+          python agent.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }}
