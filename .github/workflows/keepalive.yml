@@ -19,4 +19,4 @@ jobs:
         env:
           COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
           GITHUB_SHARED_SECRET: ${{ secrets.GITHUB_SHARED_SECRET }}
-        run: python keepalive.py
+        run: python sandbox_wrapper/keepalive.py
