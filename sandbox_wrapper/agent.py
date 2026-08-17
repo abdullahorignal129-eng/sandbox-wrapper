@@ -2,7 +2,6 @@
 """GitHub Actions worker agent with concurrent job execution using venv pools."""
 
 import argparse
-import concurrent.futures
 import logging
 import os
 import queue
@@ -10,6 +9,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 from contextlib import suppress
@@ -19,12 +19,12 @@ from typing import Callable, Dict, Optional, List
 
 import httpx
 
-# Try to import the sandbox runner (optional, not used by default)
+# The old WindowsSandboxRunner is no longer used.
+# We keep the import optional just in case some future code needs it.
 try:
     from windows_runner import WindowsSandboxRunner
 except ImportError:
     WindowsSandboxRunner = None
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +45,7 @@ class AgentConfig:
     environment: Dict[str, object]
 
     poll_interval: float = 10.0
-    stop_polling_after: float = 17700.0   # 4h55m
+    stop_polling_after: float = 17700.0          # 4h55m
     max_retries: int = 5
     base_backoff: float = 1.0
     max_backoff: float = 30.0
@@ -53,7 +53,7 @@ class AgentConfig:
     run_url: str = ""
 
     # Concurrency settings
-    venv_pool_size: int = 20                 # venvs per Python version
+    venv_pool_size: int = 20                    # venvs per Python version
     max_concurrent_per_version: Dict[str, int] = field(
         default_factory=lambda: {
             "3.11.9": 5,
@@ -62,7 +62,7 @@ class AgentConfig:
             "3.14.7": 5,
         }
     )
-    total_max_concurrent: int = 20           # global cap
+    total_max_concurrent: int = 20              # global cap
 
     python_versions: List[str] = field(default_factory=lambda: [
         "3.11.9", "3.12.10", "3.13.15", "3.14.7"
@@ -82,7 +82,6 @@ def find_python_executable(version: str) -> Optional[Path]:
     cache_dir = Path(tool_cache) / "Python"
     if not cache_dir.exists():
         return None
-    # Look for exact version or partial match (e.g., 3.12.10)
     for child in cache_dir.iterdir():
         if child.name.startswith(version):
             python_exe = child / "x64" / "python.exe"
@@ -92,28 +91,35 @@ def find_python_executable(version: str) -> Optional[Path]:
 
 
 class VenvManager:
-    """Manages pools of venvs for each Python version."""
+    """Manages a pool of ready venvs for each Python version (background creation)."""
 
     def __init__(self, python_versions: List[str], pool_size: int, venv_base_dir: Path):
         self.python_versions = python_versions
         self.pool_size = pool_size
         self.venv_base_dir = venv_base_dir
+        self.venv_base_dir.mkdir(exist_ok=True)
         self.venvs: Dict[str, queue.Queue] = {}
         self.lock = threading.Lock()
-        self._create_pool()
+        self._start_background_creation()
 
-    def _create_pool(self):
-        """Create venvs for all versions (called in background)."""
+    def _start_background_creation(self):
+        """Spawn a daemon thread to create all venvs in the background."""
         for version in self.python_versions:
             self.venvs[version] = queue.Queue()
+        t = threading.Thread(target=self._create_all_venvs, daemon=True)
+        t.start()
+
+    def _create_all_venvs(self):
+        for version in self.python_versions:
             for i in range(self.pool_size):
                 venv_dir = self.venv_base_dir / f"{version}-venv-{i}"
                 try:
                     self._create_venv(version, venv_dir)
-                    self.venvs[version].put(venv_dir)
+                    with self.lock:
+                        self.venvs[version].put(venv_dir)
                 except Exception as e:
-                    logger.error(f"Failed to create venv {version} {i}: {e}")
-                # No sleep needed; just continue
+                    logger.error(f"Failed to create venv {version} #{i}: {e}")
+            logger.info(f"Finished creating {self.pool_size} venvs for {version}")
 
     def _create_venv(self, version: str, venv_dir: Path) -> None:
         python_exe = find_python_executable(version)
@@ -126,16 +132,15 @@ class VenvManager:
         )
 
     def get_venv(self, version: str) -> Optional[Path]:
-        """Acquire a venv from the pool, or create a new one if pool empty and pool_size not reached."""
         with self.lock:
             if version not in self.venvs:
                 self.venvs[version] = queue.Queue()
             try:
                 return self.venvs[version].get_nowait()
             except queue.Empty:
-                # If pool is empty, create a new one (up to a max to avoid unbounded growth)
+                # On-demand creation if pool exhausted (up to double)
                 if self.venvs[version].qsize() < self.pool_size * 2:
-                    venv_dir = self.venv_base_dir / f"{version}-venv-on-demand-{int(time.time())}"
+                    venv_dir = self.venv_base_dir / f"{version}-venv-ondemand-{int(time.time() * 1000)}"
                     try:
                         self._create_venv(version, venv_dir)
                         return venv_dir
@@ -153,7 +158,7 @@ class VenvManager:
 # ---------------------------------------------------------------------------
 
 class JobExecutor:
-    """Runs jobs using direct interpreter or venv, respecting concurrency limits."""
+    """Runs jobs using direct interpreter (no deps) or venv (deps), respecting limits."""
 
     def __init__(self, config: AgentConfig, venv_manager: VenvManager):
         self.config = config
@@ -182,25 +187,25 @@ class JobExecutor:
                     python_exe = find_python_executable(version)
                     if not python_exe:
                         return self._infra_failure(job, f"Python {version} not found")
-                    return self._run_with_interpreter(job, python_exe)
+                    return self._run_with_interpreter(job, python_exe, install_deps=False)
 
     def _run_with_venv(self, job: dict, venv_dir: Path) -> dict:
         python_exe = venv_dir / "Scripts" / "python.exe"
         if not python_exe.exists():
             return self._infra_failure(job, "Venv python not found")
-        return self._run_with_interpreter(job, python_exe)
+        return self._run_with_interpreter(job, python_exe, install_deps=True)
 
-    def _run_with_interpreter(self, job: dict, python_exe: Path) -> dict:
-        """Write files, run entry point, capture output."""
+    def _run_with_interpreter(self, job: dict, python_exe: Path, install_deps: bool) -> dict:
         work_dir = Path(tempfile.mkdtemp(prefix="job_"))
         try:
-            for filename, content in job["files"].items():
+            # Write job files
+            for filename, content in job.get("files", {}).items():
                 file_path = work_dir / filename
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path.write_text(content, encoding="utf-8")
 
-            if job.get("dependencies"):
-                # Install dependencies into the venv (or current env)
+            # Install dependencies only if requested and dependencies exist
+            if install_deps and job.get("dependencies"):
                 subprocess.run(
                     [str(python_exe), "-m", "pip", "install", "--quiet"] + job["dependencies"],
                     check=True,
@@ -208,25 +213,18 @@ class JobExecutor:
                     timeout=120,
                 )
 
-            cmd = [str(python_exe), job["entry_point"]]
+            # Run the code
+            cmd = [str(python_exe), job.get("entry_point", "main.py")]
             result = subprocess.run(
                 cmd,
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
-                timeout=job["timeout"],
+                timeout=job.get("timeout", 15.0),
                 input=job.get("stdin") or None,
             )
 
-            timed_out = False
-            category = "success"
-            failure_reason = None
-            if result.returncode != 0:
-                if result.returncode == 124:  # timeout exit code from subprocess? Actually subprocess.TimeoutExpired is raised
-                    pass  # will be caught below
-                else:
-                    category = "checker_error"
-
+            category = "success" if result.returncode == 0 else "checker_error"
             return {
                 "job_id": job["job_id"],
                 "stdout": result.stdout,
@@ -234,21 +232,12 @@ class JobExecutor:
                 "exit_code": result.returncode,
                 "timed_out": False,
                 "category": category,
-                "failure_reason": failure_reason,
+                "failure_reason": None,
                 "network_activity_detected": None,
             }
 
         except subprocess.TimeoutExpired:
-            return {
-                "job_id": job["job_id"],
-                "stdout": "",
-                "stderr": "Timeout",
-                "exit_code": -1,
-                "timed_out": True,
-                "category": "timeout",
-                "failure_reason": f"Job timed out after {job['timeout']}s",
-                "network_activity_detected": None,
-            }
+            return self._timeout_failure(job)
         except subprocess.CalledProcessError as e:
             return self._infra_failure(job, f"Dependency install failed: {e.stderr}")
         except Exception as e:
@@ -265,6 +254,18 @@ class JobExecutor:
             "timed_out": False,
             "category": "infra_failure",
             "failure_reason": reason,
+            "network_activity_detected": None,
+        }
+
+    def _timeout_failure(self, job: dict) -> dict:
+        return {
+            "job_id": job["job_id"],
+            "stdout": "",
+            "stderr": "Timeout",
+            "exit_code": -1,
+            "timed_out": True,
+            "category": "timeout",
+            "failure_reason": f"Job timed out after {job.get('timeout', 15.0)}s",
             "network_activity_detected": None,
         }
 
@@ -358,18 +359,7 @@ class PollingAgent:
     def run(self):
         self.start_time = self.config.now_fn()
 
-        # Start background venv creation
-        venv_manager = VenvManager(
-            self.config.python_versions,
-            self.config.venv_pool_size,
-            Path("venvs"),
-        )
-        # Actually, we need to pass venv_manager to executor; but we already created it. For simplicity, we integrate later.
-
-        # For now, we use the executor passed in (which already has a venv_manager). We'll restructure later.
-        executor = self.executor
-
-        # Start a fixed number of worker threads (total_max_concurrent)
+        # Start worker threads (one per total_max_concurrent)
         worker_threads = [
             threading.Thread(target=self._worker_loop, args=(self.config.worker_id,))
             for _ in range(self.config.total_max_concurrent)
@@ -405,8 +395,7 @@ class PollingAgent:
                 self.config.sleep_fn(self.config.poll_interval)
 
         logger.info("Stop polling threshold reached; waiting for running jobs to finish...")
-        # Wait for queue to empty and running jobs to finish (with a timeout)
-        timeout = 300  # 5 minutes max
+        timeout = 300  # up to 5 minutes
         end_time = self.config.now_fn() + timeout
         while (not self.job_queue.empty() or self.running_jobs > 0) and self.config.now_fn() < end_time:
             self.config.sleep_fn(1)
@@ -437,7 +426,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Worker pool agent (concurrent)")
     parser.add_argument("--worker-id", type=int, required=True)
     parser.add_argument("--coordinator-url", required=True)
-    parser.add_argument("--mock-runner", action="store_true")
     parser.add_argument("--run-url", default="")
     parser.add_argument("--poll-interval", type=float, default=10.0)
     parser.add_argument("--stop-polling-after", type=float, default=17700.0)
@@ -452,13 +440,19 @@ def main():
         logger.error("GITHUB_SHARED_SECRET not set")
         return 1
 
-    # Discover available Python versions (fallback to default list)
-    python_versions = []
-    for v in ["3.11.9", "3.12.10", "3.13.15", "3.14.7"]:
-        if find_python_executable(v):
-            python_versions.append(v)
-    if not python_versions:
-        logger.error("No Python versions found in tool cache")
+    python_versions = [
+        v.strip()
+        for v in os.environ.get(
+            "WINDOWS_PYTHON_VERSIONS",
+            "3.11.9,3.12.10,3.13.15,3.14.7",
+        ).split(",")
+        if v.strip()
+    ]
+
+    # Verify all versions are actually available
+    missing = [v for v in python_versions if not find_python_executable(v)]
+    if missing:
+        logger.error(f"Missing Python versions in tool cache: {missing}")
         return 1
 
     environment = {
@@ -468,7 +462,11 @@ def main():
         "notes": f"Runner: {os.environ.get('RUNNER_LABEL', 'windows-2025')}; Run: {os.environ.get('GITHUB_RUN_ID', 'local')}",
     }
 
-    run_url = args.run_url or f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}" or "https://local.example.com"
+    run_url = args.run_url
+    if not run_url and "GITHUB_REPOSITORY" in os.environ and "GITHUB_RUN_ID" in os.environ:
+        run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+    if not run_url:
+        run_url = "https://local.example.com"
 
     config = AgentConfig(
         worker_id=args.worker_id,
@@ -482,7 +480,6 @@ def main():
         python_versions=python_versions,
     )
 
-    # Create venv manager and executor
     venv_manager = VenvManager(python_versions, config.venv_pool_size, Path("venvs"))
     executor = JobExecutor(config, venv_manager)
     client = CoordinatorClient(args.coordinator_url, secret)
