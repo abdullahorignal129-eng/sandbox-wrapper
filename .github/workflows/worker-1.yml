@@ -15,7 +15,7 @@ jobs:
       OS_VERSION: "ubuntu-22.04"
       RUNNER_LABEL: "ubuntu-22.04"
       COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
-      GITHUB_SHARED_SECRET: ${{ secrets.GITHUB_SHARED_SECRET }}
+      GITHUB_SHARED_SECRET: ${{ secrets.GH_SHARED_SECRET }}
       STOP_POLLING_AFTER_SECONDS: "17700"
 
     steps:
