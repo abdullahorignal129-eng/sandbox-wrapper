@@ -1,0 +1,56 @@
+name: Worker Linux 1
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'   # every 5 hours (stagger from Windows if needed)
+  workflow_dispatch:
+
+concurrency:
+  group: worker-linux-1
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-22.04   # PINNED
+    timeout-minutes: 360
+    env:
+      WORKER_ID: 2                          # change this when adding more Linux workers
+      PYTHON_VERSIONS: "3.11.9,3.12.10,3.13.15,3.14.7"
+      OS_VERSION: "ubuntu-22.04"
+      RUNNER_LABEL: "ubuntu-22.04"
+      COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
+      GITHUB_SHARED_SECRET: ${{ secrets.GH_SHARED_SECRET }}
+      STOP_POLLING_AFTER_SECONDS: "17700"   # 4h55m
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install all required Python versions into the tool cache
+      - name: Install Python 3.11.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+
+      - name: Install Python 3.12.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+
+      - name: Install Python 3.13.15
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install Python 3.14.7
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.7'
+
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r sandbox_wrapper/requirements.txt
+
+      - name: Run Linux worker agent
+        run: |
+          python agent_linux.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }}
