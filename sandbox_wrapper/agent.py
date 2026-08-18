@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows worker agent with concurrency, venv testing, and output truncation."""
+"""Windows worker agent for dataset_verification (with shutdown support)."""
 
 import argparse
 import logging
@@ -25,12 +25,8 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("worker_agent")
 
 BASE_PATH = "/dataset_verification"
-MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", 1024 * 1024))  # default 1 MB
+MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", 1024 * 1024))
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 @dataclass
 class AgentConfig:
@@ -40,7 +36,7 @@ class AgentConfig:
     environment: Dict[str, object]
 
     poll_interval: float = 10.0
-    stop_polling_after: float = 17700.0
+    stop_polling_after: float = 17700.0          # 4h55m
     max_retries: int = 5
     base_backoff: float = 1.0
     max_backoff: float = 30.0
@@ -55,7 +51,6 @@ class AgentConfig:
         "3.14.7": 5,
     })
     total_max_concurrent: int = 20
-
     python_versions: List[str] = field(default_factory=lambda: [
         "3.11.9", "3.12.10", "3.13.15", "3.14.7"
     ])
@@ -63,10 +58,6 @@ class AgentConfig:
     now_fn: Callable[[], float] = time.monotonic
     sleep_fn: Callable[[float], None] = time.sleep
 
-
-# ---------------------------------------------------------------------------
-# Python discovery & venv
-# ---------------------------------------------------------------------------
 
 def find_python_executable(version: str) -> Optional[Path]:
     tool_cache = os.environ.get("RUNNER_TOOL_CACHE", r"C:\hostedtoolcache\windows")
@@ -85,7 +76,7 @@ class VenvManager:
     def __init__(self, python_versions, pool_size, venv_base_dir):
         self.python_versions = python_versions
         self.pool_size = pool_size
-        self.venv_base_dir = venv_base_dir
+        self.venv_base_dir = venv_base_dir.resolve()
         self.venv_base_dir.mkdir(exist_ok=True)
         self.venvs = {v: queue.Queue() for v in python_versions}
         self.lock = threading.Lock()
@@ -128,6 +119,9 @@ class VenvManager:
                 self._create_venv(version, venv_dir)
                 if not self._test_venv(version, venv_dir):
                     return False
+                if not self._test_venv_pip_install(version, venv_dir):
+                    logger.error(f"Initial pip install test failed for {version}")
+                    return False
                 with self.lock:
                     self.venvs[version].put(venv_dir)
             except Exception as e:
@@ -135,21 +129,34 @@ class VenvManager:
                 return False
         return True
 
-    def _test_venv(self, version, venv_dir) -> bool:
+    def _test_venv(self, version, venv_dir):
         python_exe = venv_dir / "Scripts" / "python.exe"
         if not python_exe.exists():
-            logger.error(f"Venv python not found: {python_exe}")
             return False
         try:
             result = subprocess.run([str(python_exe), "-c", "import sys; print(sys.version)"],
                                     capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
-                logger.error(f"Venv test failed for {version}:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
                 return False
-            logger.info(f"Venv test OK for {version}: {result.stdout.strip()}")
+            logger.info(f"Venv test OK for {version}")
             return True
-        except Exception as e:
-            logger.error(f"Venv test exception for {version}: {e}")
+        except Exception:
+            return False
+
+    def _test_venv_pip_install(self, version, venv_dir):
+        python_exe = venv_dir / "Scripts" / "python.exe"
+        if not python_exe.exists():
+            return False
+        test_pkg = "six"
+        try:
+            r = subprocess.run([str(python_exe), "-m", "pip", "install", "--quiet", test_pkg],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                return False
+            import_r = subprocess.run([str(python_exe), "-c", f"import {test_pkg}"],
+                                      capture_output=True, text=True, timeout=30)
+            return import_r.returncode == 0
+        except Exception:
             return False
 
     def get_venv(self, version):
@@ -173,10 +180,6 @@ class VenvManager:
             self.venvs[version].put(venv_dir)
 
 
-# ---------------------------------------------------------------------------
-# Job executor with output truncation
-# ---------------------------------------------------------------------------
-
 class JobExecutor:
     def __init__(self, config, venv_manager):
         self.config = config
@@ -184,9 +187,8 @@ class JobExecutor:
         self.semaphores = {v: threading.Semaphore(limit) for v, limit in config.max_concurrent_per_version.items()}
         self.global_semaphore = threading.Semaphore(config.total_max_concurrent)
 
-    def _truncate(self, text: str) -> str:
+    def _truncate(self, text):
         if len(text.encode('utf-8')) > MAX_OUTPUT_BYTES:
-            # Truncate to fit byte limit, decode safely
             return text[:MAX_OUTPUT_BYTES // 2] + "\n... [truncated]"
         return text
 
@@ -207,7 +209,6 @@ class JobExecutor:
                     if not python_exe:
                         return self._infra_failure(job, f"Python {version} not found")
                     result = self._run_with_interpreter(job, python_exe, install_deps=False)
-                # Truncate output
                 result["stdout"] = self._truncate(result["stdout"])
                 result["stderr"] = self._truncate(result["stderr"])
                 return result
@@ -226,20 +227,26 @@ class JobExecutor:
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_text(content, encoding="utf-8")
             if install_deps and job.get("dependencies"):
-                subprocess.run([str(python_exe), "-m", "pip", "install", "--quiet"] + job["dependencies"],
-                               check=True, capture_output=True, timeout=120)
+                pip_result = subprocess.run(
+                    [str(python_exe), "-m", "pip", "install", "--quiet"] + job["dependencies"],
+                    check=False, capture_output=True, timeout=120,
+                )
+                if pip_result.returncode != 0:
+                    return self._dependency_install_failure(
+                        job, f"Dependency install failed: {pip_result.stderr.decode(errors='replace')}"
+                    )
             cmd = [str(python_exe), job.get("entry_point", "main.py")]
             result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True,
                                     timeout=job.get("timeout", 15.0),
                                     input=job.get("stdin") or None)
             category = "success" if result.returncode == 0 else "checker_error"
-            return {"job_id": job["job_id"], "stdout": result.stdout, "stderr": result.stderr,
-                    "exit_code": result.returncode, "timed_out": False, "category": category,
-                    "failure_reason": None, "network_activity_detected": None}
+            return {
+                "job_id": job["job_id"], "stdout": result.stdout, "stderr": result.stderr,
+                "exit_code": result.returncode, "timed_out": False, "category": category,
+                "failure_reason": None, "network_activity_detected": None,
+            }
         except subprocess.TimeoutExpired:
             return self._timeout_failure(job)
-        except subprocess.CalledProcessError as e:
-            return self._infra_failure(job, f"Dependency install failed: {e.stderr}")
         except Exception as e:
             return self._infra_failure(job, f"Execution error: {e}")
         finally:
@@ -250,6 +257,11 @@ class JobExecutor:
                 "timed_out": False, "category": "infra_failure", "failure_reason": reason,
                 "network_activity_detected": None}
 
+    def _dependency_install_failure(self, job, reason):
+        return {"job_id": job["job_id"], "stdout": "", "stderr": reason, "exit_code": 1,
+                "timed_out": False, "category": "dependency_install_failed", "failure_reason": reason,
+                "network_activity_detected": None}
+
     def _timeout_failure(self, job):
         return {"job_id": job["job_id"], "stdout": "", "stderr": "Timeout", "exit_code": -1,
                 "timed_out": True, "category": "timeout",
@@ -257,42 +269,41 @@ class JobExecutor:
                 "network_activity_detected": None}
 
 
-# ---------------------------------------------------------------------------
-# Coordinator client
-# ---------------------------------------------------------------------------
-
 class CoordinatorClient:
     def __init__(self, base_url, secret):
         self.client = httpx.Client(base_url=base_url.rstrip("/"), timeout=20.0)
         self.client.headers.update({"Authorization": f"Bearer {secret}"})
 
     def register(self, worker_id, url, environment):
-        r = self.client.post(f"{BASE_PATH}/worker/register", json={"worker_id": worker_id, "url": url, "environment": environment})
+        r = self.client.post(f"{BASE_PATH}/worker/register",
+                             json={"worker_id": worker_id, "url": url, "environment": environment})
         r.raise_for_status()
         return r.json()
 
-    def poll(self, worker_id):
-        r = self.client.post(f"{BASE_PATH}/worker/poll", json={"worker_id": worker_id})
+    def poll(self, worker_id, url):
+        r = self.client.post(f"{BASE_PATH}/worker/poll",
+                             json={"worker_id": worker_id, "url": url})
         r.raise_for_status()
-        return r.json().get("job")
+        data = r.json()
+        if data.get("shutdown"):
+            return {"shutdown": True}
+        return data.get("job")
 
     def report_result(self, worker_id, url, result):
-        r = self.client.post(f"{BASE_PATH}/worker/result", params={"worker_id": worker_id, "url": url}, json=result)
+        r = self.client.post(f"{BASE_PATH}/worker/result",
+                             params={"worker_id": worker_id, "url": url}, json=result)
         r.raise_for_status()
         return r.json()
 
     def report_done(self, worker_id, url):
-        r = self.client.post(f"{BASE_PATH}/worker/done", json={"worker_id": worker_id, "url": url})
+        r = self.client.post(f"{BASE_PATH}/worker/done",
+                             json={"worker_id": worker_id, "url": url})
         r.raise_for_status()
         return r.json()
 
     def close(self):
         self.client.close()
 
-
-# ---------------------------------------------------------------------------
-# Polling agent
-# ---------------------------------------------------------------------------
 
 class PollingAgent:
     def __init__(self, config, client, executor):
@@ -345,7 +356,6 @@ class PollingAgent:
 
     def run(self):
         self.start_time = self.config.now_fn()
-
         worker_threads = [
             threading.Thread(target=self._worker_loop, args=(self.config.worker_id,))
             for _ in range(self.config.total_max_concurrent)
@@ -355,7 +365,8 @@ class PollingAgent:
             t.start()
 
         registered = False
-        while not self.should_stop_polling():
+        should_shutdown = False
+        while not self.should_stop_polling() and not should_shutdown:
             if not registered:
                 res = self._call_with_retry(
                     lambda: self.client.register(self.config.worker_id, self.config.run_url, self.config.environment),
@@ -367,16 +378,21 @@ class PollingAgent:
                 registered = True
                 logger.info(f"Registered worker {self.config.worker_id}")
 
-            job = self._call_with_retry(
-                lambda: self.client.poll(self.config.worker_id), "poll"
+            response = self._call_with_retry(
+                lambda: self.client.poll(self.config.worker_id, self.config.run_url),
+                "poll",
             )
-            if job:
-                logger.info(f"Queued job {job.get('job_id')}")
-                self.job_queue.put(job)
+            if isinstance(response, dict) and response.get("shutdown"):
+                logger.info("Shutdown signal received from coordinator. Exiting polling loop.")
+                should_shutdown = True
+                break
+            elif response:
+                logger.info(f"Queued job {response.get('job_id')}")
+                self.job_queue.put(response)
             else:
                 self.config.sleep_fn(self.config.poll_interval)
 
-        logger.info("Stop polling threshold reached; waiting for running jobs to finish...")
+        logger.info("Stop polling threshold reached or shutdown requested; waiting for running jobs to finish...")
         timeout = 300
         end_time = self.config.now_fn() + timeout
         while (not self.job_queue.empty() or self.running_jobs > 0) and self.config.now_fn() < end_time:
@@ -400,10 +416,6 @@ class PollingAgent:
             self.job_queue.task_done()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Worker pool agent (Windows)")
     parser.add_argument("--worker-id", type=int, required=True)
@@ -413,6 +425,7 @@ def parse_args():
     parser.add_argument("--stop-polling-after", type=float, default=17700.0)
     parser.add_argument("--venv-pool-size", type=int, default=20)
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -424,9 +437,7 @@ def main():
     logger.info(f"CPU count: {os.cpu_count()}")
     logger.info(f"RAM total: {psutil.virtual_memory().total / (1024**3):.2f} GB")
 
-    python_versions = [
-        v.strip() for v in os.environ.get("WINDOWS_PYTHON_VERSIONS", "3.11.9,3.12.10,3.13.15,3.14.7").split(",") if v.strip()
-    ]
+    python_versions = [v.strip() for v in os.environ.get("WINDOWS_PYTHON_VERSIONS", "3.11.9,3.12.10,3.13.15,3.14.7").split(",") if v.strip()]
     missing = [v for v in python_versions if not find_python_executable(v)]
     if missing:
         logger.error(f"Missing Python versions: {missing}")
@@ -436,7 +447,7 @@ def main():
         "platform": "windows",
         "os_version": os.environ.get("WINDOWS_OS_VERSION", "windows-2025"),
         "python_versions": python_versions,
-        "max_concurrent_jobs": 20,   # advertised concurrency
+        "max_concurrent_jobs": 20,
         "notes": f"Runner: {os.environ.get('RUNNER_LABEL', 'windows-2025')}; Run: {os.environ.get('GITHUB_RUN_ID', 'local')}",
     }
 
@@ -458,7 +469,7 @@ def main():
         python_versions=python_versions,
     )
 
-    venv_manager = VenvManager(python_versions, config.venv_pool_size, Path("venvs"))
+    venv_manager = VenvManager(python_versions, config.venv_pool_size, Path("venvs").resolve())
     if not venv_manager.create_and_test_initial_venvs():
         logger.error("Initial venv test failed. Exiting.")
         return 1
@@ -472,6 +483,7 @@ def main():
     finally:
         client.close()
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
