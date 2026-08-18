@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
-"""Linux worker agent with concurrency, venv path checking, and output truncation."""
+"""Linux worker agent - DEBUG BUILD.
+
+Same behavior as the original agent_linux.py, but with exhaustive logging
+added at every point that touches a venv:
+
+  - At startup: for each python version, create the initial venv, print its
+    ABSOLUTE path, confirm existence, list bin/ contents, then run a REAL
+    `pip install` (not just `import sys`) against it and print full
+    stdout/stderr, so the actual failing code path is exercised at boot.
+
+  - Every time a job is assigned a venv (pool hit, pool-empty on-demand
+    creation, OR plain get_nowait() success - which was the previously
+    unlogged path): print absolute path, os.path.exists(), bin/ listing,
+    and whether bin/python passes os.access(X_OK) - RIGHT BEFORE use.
+
+  - Immediately before subprocess.run() for both `pip install` and the
+    actual job execution: print the exact resolved python_exe path and
+    whether it exists at that exact instant (to catch anything that
+    disappears between the check and the exec).
+
+  - After pip install: full stdout/stderr regardless of success/failure.
+
+Nothing about job semantics, retry logic, or the coordinator protocol is
+changed. Only logging is added, plus the two safety checks from the prior
+fix (still present) so we don't lose that fix while debugging.
+"""
 
 import argparse
 import logging
@@ -28,40 +53,46 @@ BASE_PATH = "/dataset_verification"
 MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", 1024 * 1024))  # default 1 MB
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+def _debug_dump_path(label: str, p: Path):
+    """Print exhaustive detail about a filesystem path: absolute form,
+    existence, type, and (if a venv dir) its bin/ listing with per-file
+    executability."""
+    abs_p = p.resolve()
+    logger.info(f"[PATHCHECK] {label}: given={p}  absolute={abs_p}")
+    logger.info(f"[PATHCHECK] {label}: exists={p.exists()}  "
+                f"is_dir={p.is_dir() if p.exists() else 'n/a'}  "
+                f"is_symlink={p.is_symlink()}")
+    bin_dir = p / "bin" if p.is_dir() or not p.exists() else p
+    if p.name == "bin" or (p.is_dir() and (p / "bin").exists()):
+        bin_dir = p if p.name == "bin" else (p / "bin")
+        if bin_dir.exists():
+            logger.info(f"[PATHCHECK] {label}: bin dir = {bin_dir.resolve()}")
+            try:
+                for item in sorted(bin_dir.iterdir()):
+                    st = item.lstat()
+                    logger.info(
+                        f"[PATHCHECK] {label}:   {item.name}  "
+                        f"abs={item.resolve() if item.exists() else '(broken symlink)'}  "
+                        f"exists={item.exists()}  "
+                        f"is_symlink={item.is_symlink()}  "
+                        f"x_ok={os.access(item, os.X_OK) if item.exists() else False}  "
+                        f"mode={oct(st.st_mode)}"
+                    )
+            except FileNotFoundError as e:
+                logger.info(f"[PATHCHECK] {label}: bin dir listing failed: {e}")
+        else:
+            logger.info(f"[PATHCHECK] {label}: bin dir does not exist at {bin_dir.resolve()}")
 
-@dataclass
-class AgentConfig:
-    worker_id: int
-    coordinator_url: str
-    secret: str
-    environment: Dict[str, object]
 
-    poll_interval: float = 10.0
-    stop_polling_after: float = 17700.0
-    max_retries: int = 5
-    base_backoff: float = 1.0
-    max_backoff: float = 30.0
-
-    run_url: str = ""
-
-    venv_pool_size: int = 20
-    max_concurrent_per_version: Dict[str, int] = field(default_factory=lambda: {
-        "3.11.9": 5,
-        "3.12.10": 10,
-        "3.13.15": 5,
-        "3.14.7": 5,
-    })
-    total_max_concurrent: int = 20
-
-    python_versions: List[str] = field(default_factory=lambda: [
-        "3.11.9", "3.12.10", "3.13.15", "3.14.7"
-    ])
-
-    now_fn: Callable[[], float] = time.monotonic
-    sleep_fn: Callable[[float], None] = time.sleep
+def _debug_check_python_exe(label: str, python_exe: Optional[Path]):
+    if python_exe is None:
+        logger.info(f"[PATHCHECK] {label}: python_exe is None")
+        return
+    abs_exe = python_exe.resolve()
+    logger.info(
+        f"[PATHCHECK] {label}: python_exe given={python_exe}  absolute={abs_exe}  "
+        f"exists={python_exe.exists()}  x_ok={os.access(python_exe, os.X_OK) if python_exe.exists() else False}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +121,7 @@ class VenvManager:
         self.pool_size = pool_size
         self.venv_base_dir = venv_base_dir
         self.venv_base_dir.mkdir(exist_ok=True)
+        logger.info(f"[VENVMANAGER] base dir absolute path: {self.venv_base_dir.resolve()}")
         self.venvs = {v: queue.Queue() for v in python_versions}
         self.lock = threading.Lock()
         self._start_background_creation()
@@ -113,10 +145,13 @@ class VenvManager:
         try:
             self._create_venv(version, venv_dir)
             python_exe = self._find_venv_python(venv_dir)
+            _debug_check_python_exe(f"create_and_store/{venv_dir.name}", python_exe)
             if python_exe is None or not os.access(python_exe, os.X_OK):
                 raise RuntimeError(f"venv created but python executable not usable at {venv_dir}")
             with self.lock:
                 self.venvs[version].put(venv_dir)
+            logger.info(f"[POOL] queued {venv_dir.name} for version {version} "
+                        f"(absolute={venv_dir.resolve()})")
         except Exception as e:
             logger.error(f"Failed to create venv {version} {venv_dir.name}: {e}")
 
@@ -124,8 +159,15 @@ class VenvManager:
         python_exe = find_python_executable(version)
         if not python_exe:
             raise RuntimeError(f"Python {version} not found")
-        subprocess.run([str(python_exe), "-m", "venv", str(venv_dir)],
+        logger.info(f"[CREATE] creating venv {venv_dir.resolve()} using base interpreter {python_exe.resolve()}")
+        result = subprocess.run([str(python_exe), "-m", "venv", str(venv_dir)],
                        check=True, capture_output=True)
+        logger.info(f"[CREATE] venv module exited rc={result.returncode} for {venv_dir.resolve()}")
+        if result.stdout:
+            logger.info(f"[CREATE] venv stdout: {result.stdout.decode(errors='replace')}")
+        if result.stderr:
+            logger.info(f"[CREATE] venv stderr: {result.stderr.decode(errors='replace')}")
+        _debug_dump_path(f"post-create/{venv_dir.name}", venv_dir)
 
     def _find_venv_python(self, venv_dir: Path) -> Optional[Path]:
         bin_dir = venv_dir / "bin"
@@ -151,8 +193,19 @@ class VenvManager:
                 self._log_directory_contents(venv_dir / "bin")
                 if not self._test_venv(version, venv_dir):
                     return False
+
+                # NEW: also exercise the REAL pip-install path at startup,
+                # against a harmless, fast, reliable package - this proves
+                # or disproves whether install-time behavior itself is fine
+                # right after creation, before any job ever touches it.
+                if not self._test_venv_pip_install(version, venv_dir):
+                    logger.error(f"[STARTUP-PIP-TEST] pip install smoke test failed for {version}; "
+                                 f"continuing anyway so we can observe job behavior too")
+
                 with self.lock:
                     self.venvs[version].put(venv_dir)
+                logger.info(f"[POOL] queued initial test-venv {venv_dir.name} for version {version} "
+                            f"(absolute={venv_dir.resolve()})")
             except Exception as e:
                 logger.error(f"Initial venv test failed for {version}: {e}")
                 return False
@@ -160,6 +213,7 @@ class VenvManager:
 
     def _test_venv(self, version, venv_dir) -> bool:
         python_exe = self._find_venv_python(venv_dir)
+        _debug_check_python_exe(f"test_venv/{venv_dir.name}", python_exe)
         if python_exe is None:
             logger.error(f"Venv python not found in {venv_dir / 'bin'}")
             self._log_directory_contents(venv_dir / "bin")
@@ -176,26 +230,81 @@ class VenvManager:
             logger.error(f"Venv test exception for {version}: {e}")
             return False
 
+    def _test_venv_pip_install(self, version, venv_dir) -> bool:
+        """Run a REAL pip install (not just `import sys`) against the
+        just-created venv, right now, at startup - to see if the
+        install-time code path itself works before any job ever uses it."""
+        python_exe = self._find_venv_python(venv_dir)
+        _debug_check_python_exe(f"pip_install_test/{venv_dir.name}", python_exe)
+        if python_exe is None:
+            logger.error(f"[STARTUP-PIP-TEST] no python exe found for {venv_dir}")
+            return False
+        test_pkg = "six"
+        logger.info(f"[STARTUP-PIP-TEST] running: {python_exe.resolve()} -m pip install --quiet {test_pkg}")
+        try:
+            result = subprocess.run(
+                [str(python_exe), "-m", "pip", "install", "--quiet", test_pkg],
+                capture_output=True, text=True, timeout=120,
+            )
+            logger.info(f"[STARTUP-PIP-TEST] rc={result.returncode}")
+            logger.info(f"[STARTUP-PIP-TEST] stdout:\n{result.stdout}")
+            logger.info(f"[STARTUP-PIP-TEST] stderr:\n{result.stderr}")
+            _debug_dump_path(f"post-pip-install/{venv_dir.name}", venv_dir)
+            if result.returncode != 0:
+                return False
+            # confirm the interpreter is STILL there and executable after install
+            python_exe_after = self._find_venv_python(venv_dir)
+            _debug_check_python_exe(f"pip_install_test-AFTER/{venv_dir.name}", python_exe_after)
+            if python_exe_after is None or not os.access(python_exe_after, os.X_OK):
+                logger.error(f"[STARTUP-PIP-TEST] python exe vanished or became non-executable "
+                             f"AFTER pip install completed for {venv_dir}")
+                return False
+            # actually run the import to prove it works end to end
+            run_result = subprocess.run(
+                [str(python_exe_after), "-c", f"import {test_pkg}; print('{test_pkg} import OK')"],
+                capture_output=True, text=True, timeout=30,
+            )
+            logger.info(f"[STARTUP-PIP-TEST] post-install import test rc={run_result.returncode} "
+                        f"stdout={run_result.stdout.strip()} stderr={run_result.stderr.strip()}")
+            return run_result.returncode == 0
+        except Exception as e:
+            logger.error(f"[STARTUP-PIP-TEST] exception during pip install test: {e}")
+            _debug_dump_path(f"post-pip-install-EXCEPTION/{venv_dir.name}", venv_dir)
+            return False
+
     def _log_directory_contents(self, path: Path):
         if path.exists():
-            logger.info(f"Contents of {path}:")
+            logger.info(f"Contents of {path} (absolute={path.resolve()}):")
             for item in sorted(path.iterdir()):
                 logger.info(f"  {item.name}")
         else:
-            logger.warning(f"Directory does not exist: {path}")
+            logger.warning(f"Directory does not exist: {path} (absolute={path.resolve()})")
 
     def get_venv(self, version):
         with self.lock:
             if version not in self.venvs:
                 self.venvs[version] = queue.Queue()
             try:
-                return self.venvs[version].get_nowait()
+                venv_dir = self.venvs[version].get_nowait()
+                logger.info(f"[GET_VENV] pool-hit for {version}: got {venv_dir.name} "
+                            f"(absolute={venv_dir.resolve()})")
+                _debug_dump_path(f"get_venv-pool-hit/{venv_dir.name}", venv_dir)
+                python_exe = self._find_venv_python(venv_dir)
+                _debug_check_python_exe(f"get_venv-pool-hit/{venv_dir.name}", python_exe)
+                if python_exe is None or not os.access(python_exe, os.X_OK):
+                    logger.error(f"[GET_VENV] pool-hit venv {venv_dir.name} is BROKEN at the moment "
+                                 f"of assignment (python_exe={python_exe}). This is the smoking gun: "
+                                 f"it passed validation earlier but is not usable right now.")
+                return venv_dir
             except queue.Empty:
                 if self.venvs[version].qsize() < self.pool_size * 2:
                     venv_dir = self.venv_base_dir / f"{version}-venv-ondemand-{int(time.time()*1000)}"
+                    logger.info(f"[GET_VENV] pool-empty for {version}, creating on-demand: "
+                                f"{venv_dir.resolve()}")
                     try:
                         self._create_venv(version, venv_dir)
                         python_exe = self._find_venv_python(venv_dir)
+                        _debug_check_python_exe(f"get_venv-ondemand/{venv_dir.name}", python_exe)
                         if python_exe is None or not os.access(python_exe, os.X_OK):
                             raise RuntimeError(f"on-demand venv created but python executable not usable at {venv_dir}")
                         return venv_dir
@@ -205,6 +314,8 @@ class VenvManager:
 
     def release_venv(self, version, venv_dir):
         with self.lock:
+            logger.info(f"[RELEASE_VENV] releasing {venv_dir.name} back to pool for {version} "
+                        f"(absolute={venv_dir.resolve()}, still_exists={venv_dir.exists()})")
             self.venvs[version].put(venv_dir)
 
 
@@ -226,12 +337,18 @@ class JobExecutor:
 
     def execute(self, job):
         version = job["python_version"]
+        job_id = job.get("job_id")
+        logger.info(f"[EXECUTE] job {job_id} starting, version={version}, "
+                    f"dependencies={job.get('dependencies')}")
         with self.global_semaphore:
             with self.semaphores[version]:
                 if job.get("dependencies"):
                     venv_dir = self.venv_manager.get_venv(version)
                     if venv_dir is None:
+                        logger.error(f"[EXECUTE] job {job_id}: no venv available for {version}")
                         return self._infra_failure(job, "No venv available")
+                    logger.info(f"[EXECUTE] job {job_id}: assigned venv {venv_dir.name} "
+                                f"(absolute={venv_dir.resolve()}) exists={venv_dir.exists()}")
                     try:
                         result = self._run_with_venv(job, venv_dir)
                     finally:
@@ -240,28 +357,58 @@ class JobExecutor:
                     python_exe = find_python_executable(version)
                     if not python_exe:
                         return self._infra_failure(job, f"Python {version} not found")
+                    logger.info(f"[EXECUTE] job {job_id}: using base interpreter "
+                                f"{python_exe.resolve()}")
                     result = self._run_with_interpreter(job, python_exe, install_deps=False)
                 result["stdout"] = self._truncate(result["stdout"])
                 result["stderr"] = self._truncate(result["stderr"])
+                logger.info(f"[EXECUTE] job {job_id}: finished category={result['category']}")
                 return result
 
     def _run_with_venv(self, job, venv_dir):
+        job_id = job.get("job_id")
+        _debug_dump_path(f"run_with_venv/job_{job_id}/{venv_dir.name}", venv_dir)
         python_exe = self.venv_manager._find_venv_python(venv_dir)  # reuse robust finder
+        _debug_check_python_exe(f"run_with_venv/job_{job_id}", python_exe)
         if python_exe is None:
+            logger.error(f"[RUN_WITH_VENV] job {job_id}: venv python not found at moment of use "
+                         f"for {venv_dir.resolve()}")
             return self._infra_failure(job, "Venv python not found")
         return self._run_with_interpreter(job, python_exe, install_deps=True)
 
     def _run_with_interpreter(self, job, python_exe, install_deps):
+        job_id = job.get("job_id")
         work_dir = Path(tempfile.mkdtemp(prefix="job_"))
+        logger.info(f"[RUN] job {job_id}: work_dir={work_dir.resolve()}, "
+                    f"python_exe={python_exe} absolute={python_exe.resolve() if Path(python_exe).exists() else '(missing)'}, "
+                    f"exists_right_now={Path(python_exe).exists()}")
         try:
             for filename, content in job.get("files", {}).items():
                 fp = work_dir / filename
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_text(content, encoding="utf-8")
             if install_deps and job.get("dependencies"):
-                subprocess.run([str(python_exe), "-m", "pip", "install", "--quiet"] + job["dependencies"],
-                               check=True, capture_output=True, timeout=120)
+                logger.info(f"[RUN] job {job_id}: pre-pip-install check, python_exe exists="
+                            f"{Path(python_exe).exists()} x_ok={os.access(python_exe, os.X_OK)}")
+                logger.info(f"[RUN] job {job_id}: running pip install: "
+                            f"{python_exe} -m pip install --quiet {job['dependencies']}")
+                pip_result = subprocess.run(
+                    [str(python_exe), "-m", "pip", "install", "--quiet"] + job["dependencies"],
+                    check=False, capture_output=True, timeout=120,
+                )
+                logger.info(f"[RUN] job {job_id}: pip install rc={pip_result.returncode}")
+                logger.info(f"[RUN] job {job_id}: pip stdout: {pip_result.stdout.decode(errors='replace')}")
+                logger.info(f"[RUN] job {job_id}: pip stderr: {pip_result.stderr.decode(errors='replace')}")
+                logger.info(f"[RUN] job {job_id}: post-pip-install check, python_exe exists="
+                            f"{Path(python_exe).exists()} x_ok={os.access(python_exe, os.X_OK) if Path(python_exe).exists() else False}")
+                if pip_result.returncode != 0:
+                    return self._infra_failure(
+                        job, f"Dependency install failed: {pip_result.stderr}"
+                    )
+            logger.info(f"[RUN] job {job_id}: pre-exec check, python_exe exists="
+                        f"{Path(python_exe).exists()} x_ok={os.access(python_exe, os.X_OK) if Path(python_exe).exists() else False}")
             cmd = [str(python_exe), job.get("entry_point", "main.py")]
+            logger.info(f"[RUN] job {job_id}: executing cmd={cmd} cwd={work_dir.resolve()}")
             result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True,
                                     timeout=job.get("timeout", 15.0),
                                     input=job.get("stdin") or None)
@@ -270,10 +417,15 @@ class JobExecutor:
                     "exit_code": result.returncode, "timed_out": False, "category": category,
                     "failure_reason": None, "network_activity_detected": None}
         except subprocess.TimeoutExpired:
+            logger.error(f"[RUN] job {job_id}: TimeoutExpired")
             return self._timeout_failure(job)
         except subprocess.CalledProcessError as e:
+            logger.error(f"[RUN] job {job_id}: CalledProcessError: {e.stderr}")
             return self._infra_failure(job, f"Dependency install failed: {e.stderr}")
         except Exception as e:
+            logger.error(f"[RUN] job {job_id}: Exception during execution: {type(e).__name__}: {e}")
+            logger.error(f"[RUN] job {job_id}: python_exe at exception time: {python_exe}  "
+                         f"exists={Path(python_exe).exists()}")
             return self._infra_failure(job, f"Execution error: {e}")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -438,7 +590,7 @@ class PollingAgent:
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Worker pool agent (Linux)")
+    parser = argparse.ArgumentParser(description="Worker pool agent (Linux, DEBUG)")
     parser.add_argument("--worker-id", type=int, required=True)
     parser.add_argument("--coordinator-url", required=True)
     parser.add_argument("--run-url", default="")
@@ -446,6 +598,38 @@ def parse_args():
     parser.add_argument("--stop-polling-after", type=float, default=17700.0)
     parser.add_argument("--venv-pool-size", type=int, default=20)
     return parser.parse_args()
+
+@dataclass
+class AgentConfig:
+    worker_id: int
+    coordinator_url: str
+    secret: str
+    environment: Dict[str, object]
+
+    poll_interval: float = 10.0
+    stop_polling_after: float = 17700.0
+    max_retries: int = 5
+    base_backoff: float = 1.0
+    max_backoff: float = 30.0
+
+    run_url: str = ""
+
+    venv_pool_size: int = 20
+    max_concurrent_per_version: Dict[str, int] = field(default_factory=lambda: {
+        "3.11.9": 5,
+        "3.12.10": 10,
+        "3.13.15": 5,
+        "3.14.7": 5,
+    })
+    total_max_concurrent: int = 20
+
+    python_versions: List[str] = field(default_factory=lambda: [
+        "3.11.9", "3.12.10", "3.13.15", "3.14.7"
+    ])
+
+    now_fn: Callable[[], float] = time.monotonic
+    sleep_fn: Callable[[float], None] = time.sleep
+
 
 def main():
     args = parse_args()
@@ -456,6 +640,7 @@ def main():
 
     logger.info(f"CPU count: {os.cpu_count()}")
     logger.info(f"RAM total: {psutil.virtual_memory().total / (1024**3):.2f} GB")
+    logger.info(f"[STARTUP] cwd={os.getcwd()}  absolute cwd={Path.cwd().resolve()}")
 
     python_versions = [
         v.strip() for v in os.environ.get("PYTHON_VERSIONS", "3.11.9,3.12.10,3.13.15,3.14.7").split(",") if v.strip()
