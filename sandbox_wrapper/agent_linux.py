@@ -112,6 +112,9 @@ class VenvManager:
     def _create_and_store(self, version, venv_dir):
         try:
             self._create_venv(version, venv_dir)
+            python_exe = self._find_venv_python(venv_dir)
+            if python_exe is None or not os.access(python_exe, os.X_OK):
+                raise RuntimeError(f"venv created but python executable not usable at {venv_dir}")
             with self.lock:
                 self.venvs[version].put(venv_dir)
         except Exception as e:
@@ -192,6 +195,9 @@ class VenvManager:
                     venv_dir = self.venv_base_dir / f"{version}-venv-ondemand-{int(time.time()*1000)}"
                     try:
                         self._create_venv(version, venv_dir)
+                        python_exe = self._find_venv_python(venv_dir)
+                        if python_exe is None or not os.access(python_exe, os.X_OK):
+                            raise RuntimeError(f"on-demand venv created but python executable not usable at {venv_dir}")
                         return venv_dir
                     except Exception as e:
                         logger.error(f"On-demand venv creation failed: {e}")
