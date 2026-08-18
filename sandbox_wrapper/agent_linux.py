@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Linux worker agent for the HF Space worker-pool coordinator.
-
-This is identical in logic to the Windows agent, but adapted for Linux:
-- Python executable discovery under /opt/hostedtoolcache
-- venv binary path `venv/bin/python`
-"""
+"""Linux worker agent for the HF Space coordinator (multi-project router)."""
 
 import argparse
 import logging
@@ -13,20 +8,27 @@ import queue
 import random
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Optional, List
 
 import httpx
+import psutil
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("worker_agent_linux")
+
+# Base path for this project's endpoints on the multi-project router
+BASE_PATH = "/dataset_verification"
 
 
 # ---------------------------------------------------------------------------
@@ -48,16 +50,14 @@ class AgentConfig:
 
     run_url: str = ""
 
-    # Concurrency settings (same as Windows)
+    # Concurrency settings
     venv_pool_size: int = 20
-    max_concurrent_per_version: Dict[str, int] = field(
-        default_factory=lambda: {
-            "3.11.9": 5,
-            "3.12.10": 10,
-            "3.13.15": 5,
-            "3.14.7": 5,
-        }
-    )
+    max_concurrent_per_version: Dict[str, int] = field(default_factory=lambda: {
+        "3.11.9": 5,
+        "3.12.10": 10,
+        "3.13.15": 5,
+        "3.14.7": 5,
+    })
     total_max_concurrent: int = 20
 
     python_versions: List[str] = field(default_factory=lambda: [
@@ -79,13 +79,11 @@ def find_python_executable(version: str) -> Optional[Path]:
     if not cache_dir.exists():
         return None
 
-    # actions/setup-python on Linux installs to /opt/hostedtoolcache/Python/<version>/x64/bin/python3
     for child in cache_dir.iterdir():
         if child.name.startswith(version):
             python_exe = child / "x64" / "bin" / "python3"
             if python_exe.exists():
                 return python_exe
-            # Sometimes the path may be without 'x64'
             python_exe = child / "bin" / "python3"
             if python_exe.exists():
                 return python_exe
@@ -111,16 +109,24 @@ class VenvManager:
         t.start()
 
     def _create_all_venvs(self):
-        for version in self.python_versions:
-            for i in range(self.pool_size):
-                venv_dir = self.venv_base_dir / f"{version}-venv-{i}"
-                try:
-                    self._create_venv(version, venv_dir)
-                    with self.lock:
-                        self.venvs[version].put(venv_dir)
-                except Exception as e:
-                    logger.error(f"Failed to create venv {version} #{i}: {e}")
-            logger.info(f"Finished creating {self.pool_size} venvs for {version}")
+        """Create all venvs in parallel (limited by CPU count)."""
+        max_workers = min(4, os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for version in self.python_versions:
+                for i in range(self.pool_size):
+                    venv_dir = self.venv_base_dir / f"{version}-venv-{i}"
+                    futures.append(executor.submit(self._create_and_store_venv, version, venv_dir))
+            for f in futures:
+                f.result()
+
+    def _create_and_store_venv(self, version: str, venv_dir: Path):
+        try:
+            self._create_venv(version, venv_dir)
+            with self.lock:
+                self.venvs[version].put(venv_dir)
+        except Exception as e:
+            logger.error(f"Failed to create venv {version} #{venv_dir.name}: {e}")
 
     def _create_venv(self, version: str, venv_dir: Path) -> None:
         python_exe = find_python_executable(version)
@@ -132,6 +138,46 @@ class VenvManager:
             capture_output=True,
         )
 
+    def create_and_test_initial_venvs(self) -> bool:
+        """Create one venv per version and test it. Returns True if all pass."""
+        for version in self.python_versions:
+            venv_dir = self.venv_base_dir / f"{version}-test-venv"
+            try:
+                self._create_venv(version, venv_dir)
+                if not self._test_venv(version, venv_dir):
+                    return False
+                with self.lock:
+                    self.venvs[version].put(venv_dir)
+            except Exception as e:
+                logger.error(f"Initial venv test failed for {version}: {e}")
+                return False
+        return True
+
+    def _test_venv(self, version: str, venv_dir: Path) -> bool:
+        python_exe = venv_dir / "bin" / "python"
+        if not python_exe.exists():
+            python_exe = venv_dir / "bin" / "python3"
+        if not python_exe.exists():
+            logger.error(f"Venv python not found: {venv_dir / 'bin'}")
+            return False
+        try:
+            result = subprocess.run(
+                [str(python_exe), "-c", "import sys; print(sys.version)"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                logger.error(
+                    f"Venv test failed for {version}:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+                )
+                return False
+            logger.info(f"Venv test OK for {version}: {result.stdout.strip()}")
+            return True
+        except Exception as e:
+            logger.error(f"Venv test exception for {version}: {e}")
+            return False
+
     def get_venv(self, version: str) -> Optional[Path]:
         with self.lock:
             if version not in self.venvs:
@@ -139,7 +185,6 @@ class VenvManager:
             try:
                 return self.venvs[version].get_nowait()
             except queue.Empty:
-                # On-demand creation if pool exhausted (up to double)
                 if self.venvs[version].qsize() < self.pool_size * 2:
                     venv_dir = self.venv_base_dir / f"{version}-venv-ondemand-{int(time.time() * 1000)}"
                     try:
@@ -159,8 +204,6 @@ class VenvManager:
 # ---------------------------------------------------------------------------
 
 class JobExecutor:
-    """Runs jobs using direct interpreter (no deps) or venv (deps), respecting limits."""
-
     def __init__(self, config: AgentConfig, venv_manager: VenvManager):
         self.config = config
         self.venv_manager = venv_manager
@@ -269,7 +312,7 @@ class JobExecutor:
 
 
 # ---------------------------------------------------------------------------
-# Coordinator client (identical to Windows)
+# Coordinator client
 # ---------------------------------------------------------------------------
 
 class CoordinatorClient:
@@ -278,22 +321,32 @@ class CoordinatorClient:
         self.client.headers.update({"Authorization": f"Bearer {secret}"})
 
     def register(self, worker_id: int, url: str, environment: dict) -> dict:
-        r = self.client.post("/worker/register", json={"worker_id": worker_id, "url": url, "environment": environment})
+        r = self.client.post(
+            f"{BASE_PATH}/worker/register",
+            json={"worker_id": worker_id, "url": url, "environment": environment},
+        )
         r.raise_for_status()
         return r.json()
 
     def poll(self, worker_id: int) -> Optional[dict]:
-        r = self.client.post("/worker/poll", json={"worker_id": worker_id})
+        r = self.client.post(f"{BASE_PATH}/worker/poll", json={"worker_id": worker_id})
         r.raise_for_status()
         return r.json().get("job")
 
-    def report_result(self, worker_id: int, result: dict) -> dict:
-        r = self.client.post("/worker/result", params={"worker_id": worker_id}, json=result)
+    def report_result(self, worker_id: int, url: str, result: dict) -> dict:
+        r = self.client.post(
+            f"{BASE_PATH}/worker/result",
+            params={"worker_id": worker_id, "url": url},
+            json=result,
+        )
         r.raise_for_status()
         return r.json()
 
-    def report_done(self, worker_id: int) -> dict:
-        r = self.client.post("/worker/done", json={"worker_id": worker_id})
+    def report_done(self, worker_id: int, url: str) -> dict:
+        r = self.client.post(
+            f"{BASE_PATH}/worker/done",
+            json={"worker_id": worker_id, "url": url},
+        )
         r.raise_for_status()
         return r.json()
 
@@ -302,7 +355,7 @@ class CoordinatorClient:
 
 
 # ---------------------------------------------------------------------------
-# Polling agent (identical to Windows)
+# Polling agent
 # ---------------------------------------------------------------------------
 
 class PollingAgent:
@@ -331,17 +384,20 @@ class PollingAgent:
                 if attempt > self.config.max_retries:
                     logger.error(f"{description} failed after {self.config.max_retries} attempts: {e}")
                     return None
-                delay = min(self.config.base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.5), self.config.max_backoff)
+                delay = min(
+                    self.config.base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.5),
+                    self.config.max_backoff,
+                )
                 logger.warning(f"{description} attempt {attempt} failed ({e}); retrying in {delay:.1f}s")
                 self.config.sleep_fn(delay)
 
     def _report_result_thread(self, worker_id: int, result: dict):
         reported = self._call_with_retry(
-            lambda: self.client.report_result(worker_id, result),
+            lambda: self.client.report_result(worker_id, self.config.run_url, result),
             "report_result",
         )
         if reported is None:
-            logger.error(f"Failed to report result for {result.get('job_id')}; coordinator will re-queue after claim timeout")
+            logger.error(f"Failed to report result for {result.get('job_id')}")
         else:
             logger.info(f"Reported result for {result.get('job_id')}")
         with self.lock:
@@ -400,7 +456,7 @@ class PollingAgent:
         logger.info("Calling report_done and shutting down")
         if registered:
             self._call_with_retry(
-                lambda: self.client.report_done(self.config.worker_id),
+                lambda: self.client.report_done(self.config.worker_id, self.config.run_url),
                 "report_done",
             )
         logger.info("Shutdown complete")
@@ -436,6 +492,10 @@ def main():
     if not secret:
         logger.error("GITHUB_SHARED_SECRET not set")
         return 1
+
+    # Print CPU/RAM info
+    logger.info(f"CPU count: {os.cpu_count()}")
+    logger.info(f"RAM total: {psutil.virtual_memory().total / (1024**3):.2f} GB")
 
     python_versions = [
         v.strip()
@@ -477,6 +537,12 @@ def main():
     )
 
     venv_manager = VenvManager(python_versions, config.venv_pool_size, Path("venvs"))
+
+    # Test initial venvs before starting pool
+    if not venv_manager.create_and_test_initial_venvs():
+        logger.error("Initial venv test failed. Exiting.")
+        return 1
+
     executor = JobExecutor(config, venv_manager)
     client = CoordinatorClient(args.coordinator_url, secret)
     agent = PollingAgent(config, client, executor)
@@ -487,6 +553,7 @@ def main():
         client.close()
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
