@@ -53,4 +53,4 @@ jobs:
 
       - name: Run Linux worker agent
         run: |
-          python agent_linux.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }}
+          python sandbox_wrapper/agent_linux.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }}
