@@ -15,7 +15,7 @@ jobs:
       WINDOWS_OS_VERSION: "windows-2025"
       RUNNER_LABEL: "windows-2025"
       COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
-      GITHUB_SHARED_SECRET: ${{ secrets.GITHUB_SHARED_SECRET }}
+      GITHUB_SHARED_SECRET: ${{ secrets.GH_SHARED_SECRET }}
       STOP_POLLING_AFTER_SECONDS: "17700"
 
     steps:
