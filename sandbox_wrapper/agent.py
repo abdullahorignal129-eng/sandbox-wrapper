@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("worker_agent")
 
 BASE_PATH = "/dataset_verification"
-MAX_OUTPUT_BYTES = 512 * 1024  # 512 KB truncation
+MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", 1024 * 1024))  # default 1 MB
 
 
 # ---------------------------------------------------------------------------
