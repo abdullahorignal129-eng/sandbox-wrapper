@@ -189,7 +189,9 @@ class JobExecutor:
                     return self._run_with_interpreter(job, python_exe, install_deps=False)
 
     def _run_with_venv(self, job: dict, venv_dir: Path) -> dict:
-        python_exe = venv_dir / "bin" / "python"   # Linux venv binary path
+        python_exe = venv_dir / "bin" / "python"
+        if not python_exe.exists():
+            python_exe = venv_dir / "bin" / "python3"
         if not python_exe.exists():
             return self._infra_failure(job, "Venv python not found")
         return self._run_with_interpreter(job, python_exe, install_deps=True)
