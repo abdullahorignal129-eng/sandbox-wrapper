@@ -15,6 +15,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install keepalive dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r sandbox_wrapper/requirements.txt
+
       - name: Run keepalive ping
         env:
           COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
