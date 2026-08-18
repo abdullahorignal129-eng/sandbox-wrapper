@@ -1,31 +1,26 @@
-name: Worker Linux 1
+name: Worker 1 (Windows)
 
 on:
   schedule:
-    - cron: '0 */5 * * *'   # every 5 hours (stagger from Windows if needed)
+    - cron: '0 */5 * * *'
   workflow_dispatch:
-
-concurrency:
-  group: worker-linux-1
-  cancel-in-progress: false
 
 jobs:
   worker:
-    runs-on: ubuntu-22.04   # PINNED
+    runs-on: windows-2025
     timeout-minutes: 360
     env:
-      WORKER_ID: 2                          # change this when adding more Linux workers
-      PYTHON_VERSIONS: "3.11.9,3.12.10,3.13.15,3.14.7"
-      OS_VERSION: "ubuntu-22.04"
-      RUNNER_LABEL: "ubuntu-22.04"
+      WORKER_ID: 1
+      WINDOWS_PYTHON_VERSIONS: "3.11.9,3.12.10,3.13.15,3.14.7"
+      WINDOWS_OS_VERSION: "windows-2025"
+      RUNNER_LABEL: "windows-2025"
       COORDINATOR_URL: ${{ secrets.COORDINATOR_URL }}
-      GITHUB_SHARED_SECRET: ${{ secrets.GH_SHARED_SECRET }}
-      STOP_POLLING_AFTER_SECONDS: "17700"   # 4h55m
+      GITHUB_SHARED_SECRET: ${{ secrets.GITHUB_SHARED_SECRET }}
+      STOP_POLLING_AFTER_SECONDS: "17700"
 
     steps:
       - uses: actions/checkout@v4
 
-      # Install all required Python versions into the tool cache
       - name: Install Python 3.11.9
         uses: actions/setup-python@v5
         with:
@@ -46,11 +41,18 @@ jobs:
         with:
           python-version: '3.14.7'
 
-      - name: Install agent dependencies
+      - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r sandbox_wrapper/requirements.txt
 
-      - name: Run Linux worker agent
+      - name: Print system resources
+        shell: pwsh
         run: |
-          python sandbox_wrapper/agent_linux.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }}
+          python -c "import os, psutil; print('CPU cores:', os.cpu_count(), 'RAM GB:', round(psutil.virtual_memory().total/1e9, 2))"
+
+      - name: Run worker agent
+        shell: pwsh
+        run: |
+          python sandbox_wrapper/agent.py --worker-id ${{ env.WORKER_ID }} --coordinator-url ${{ secrets.COORDINATOR_URL }}
