@@ -38,7 +38,7 @@ class AgentConfig:
     environment: Dict[str, object]
 
     poll_interval: float = 10.0
-    stop_polling_after: float = 17700.0          # 4h55m
+    stop_polling_after: float = 17700.0
     max_retries: int = 5
     base_backoff: float = 1.0
     max_backoff: float = 30.0
@@ -57,9 +57,8 @@ class AgentConfig:
         "3.11.9", "3.12.10", "3.13.15", "3.14.7"
     ])
 
-    # V2: Batch processing settings
     batch_size: int = 50
-    batch_report_threshold: int = 10  # Report results after this many complete
+    batch_report_threshold: int = 10
 
     now_fn: Callable[[], float] = time.monotonic
     sleep_fn: Callable[[float], None] = time.sleep
@@ -198,41 +197,27 @@ class JobExecutor:
             return text[:MAX_OUTPUT_BYTES // 2] + "\n... [truncated]"
         return text
 
-    # ==================== V2: Filesystem Snapshotting ====================
-
     def _snapshot_workspace(self, work_dir: Path) -> Dict[str, str]:
-        """
-        Recursively scan work_dir, base64-encode each file's content,
-        and return a dict mapping relative paths to base64-encoded strings.
-        Skips files larger than MAX_FILESYSTEM_STATE_BYTES.
-        Uses absolute paths internally to avoid resolution errors.
-        """
         filesystem_state = {}
         work_dir_abs = work_dir.resolve()
 
         if not work_dir_abs.exists():
             return filesystem_state
 
-        # Use os.walk for reliable recursive traversal
         for root, dirs, files in os.walk(work_dir_abs):
             root_path = Path(root)
             for filename in files:
                 file_path = root_path / filename
                 try:
-                    # Get size before reading
                     file_size = file_path.stat().st_size
                     if file_size > MAX_FILESYSTEM_STATE_BYTES:
                         logger.debug(f"Skipping {file_path} ({file_size} bytes > {MAX_FILESYSTEM_STATE_BYTES} limit)")
                         continue
 
-                    # Read file content as bytes
                     with open(file_path, 'rb') as f:
                         content_bytes = f.read()
 
-                    # Base64 encode and decode to string
-                    encoded = base64.b64encode(content_bytes).decode('utf-8')[reference:0]
-
-                    # Store relative path (relative to work_dir_abs)
+                    encoded = base64.b64encode(content_bytes).decode('utf-8')
                     rel_path = str(file_path.relative_to(work_dir_abs))
                     filesystem_state[rel_path] = encoded
 
@@ -242,7 +227,6 @@ class JobExecutor:
         return filesystem_state
 
     def _build_result_with_snapshot(self, job: dict, base_result: dict, work_dir: Path) -> dict:
-        """Add filesystem_state to the result and clean up."""
         try:
             filesystem_state = self._snapshot_workspace(work_dir)
             base_result["filesystem_state"] = filesystem_state
@@ -280,16 +264,13 @@ class JobExecutor:
         return self._run_with_interpreter(job, python_exe, install_deps=True)
 
     def _run_with_interpreter(self, job, python_exe, install_deps):
-        # Create temporary workspace and get its absolute path[reference:1]
-        work_dir = Path(tempfile.mkdtemp(prefix="job_")).resolve()[reference:2]
+        work_dir = Path(tempfile.mkdtemp(prefix="job_")).resolve()
         try:
-            # Write job files to workspace
             for filename, content in job.get("files", {}).items():
                 fp = work_dir / filename
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_text(content, encoding="utf-8")
 
-            # Install dependencies if needed
             if install_deps and job.get("dependencies"):
                 pip_result = subprocess.run(
                     [str(python_exe), "-m", "pip", "install", "--quiet"] + job["dependencies"],
@@ -300,7 +281,6 @@ class JobExecutor:
                         job, f"Dependency install failed: {pip_result.stderr.decode(errors='replace')}"
                     )
 
-            # Execute the job
             cmd = [str(python_exe), job.get("entry_point", "main.py")]
             result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True,
                                     timeout=job.get("timeout", 15.0),
@@ -313,14 +293,11 @@ class JobExecutor:
                 "failure_reason": None, "network_activity_detected": None,
             }
 
-            # V2: Snapshot the workspace and add filesystem_state
             return self._build_result_with_snapshot(job, base_result, work_dir)
 
         except subprocess.TimeoutExpired:
-            # Snapshot workspace before returning timeout failure
             base_result = self._timeout_failure(job)
             try:
-                # Try to snapshot what we can before cleanup
                 fs_state = self._snapshot_workspace(work_dir)
                 base_result["filesystem_state"] = fs_state
             except Exception:
@@ -331,7 +308,6 @@ class JobExecutor:
             return self._infra_failure(job, f"Execution error: {e}")
 
         finally:
-            # Clean up workspace[reference:3]
             shutil.rmtree(work_dir, ignore_errors=True)
 
     def _infra_failure(self, job, reason):
@@ -359,7 +335,7 @@ class JobExecutor:
 
 class CoordinatorClient:
     def __init__(self, base_url, secret):
-        self.client = httpx.Client(base_url=base_url.rstrip("/"), timeout=20.0)[reference:4]
+        self.client = httpx.Client(base_url=base_url.rstrip("/"), timeout=20.0)
         self.client.headers.update({"Authorization": f"Bearer {secret}"})
 
     def register(self, worker_id, url, environment):
@@ -377,13 +353,7 @@ class CoordinatorClient:
             return {"shutdown": True}
         return data.get("job")
 
-    # ==================== V2: Batch Endpoints ====================
-
     def poll_batch(self, worker_id: int, url: str, batch_size: int = 50) -> List[dict]:
-        """
-        V2: Poll up to batch_size jobs from the coordinator.
-        Returns a list of job dicts, or [{"shutdown": True}] if shutdown signal received.
-        """
         try:
             r = self.client.post(
                 f"{BASE_PATH}/worker/jobs/batch",
@@ -391,7 +361,6 @@ class CoordinatorClient:
             )
             r.raise_for_status()
             data = r.json()
-            # Check for shutdown signal
             if data.get("shutdown"):
                 return [{"shutdown": True}]
             return data.get("jobs", [])
@@ -402,9 +371,6 @@ class CoordinatorClient:
             raise
 
     def report_results_batch(self, worker_id: int, url: str, results: List[dict]) -> dict:
-        """
-        V2: Report multiple results to the coordinator in a single call.
-        """
         r = self.client.post(
             f"{BASE_PATH}/worker/results/batch",
             json={"worker_id": worker_id, "url": url, "results": results}
@@ -437,10 +403,8 @@ class PollingAgent:
         self.job_queue = queue.Queue()
         self.running_jobs = 0
         self.lock = threading.Lock()
-        # V2: Batch result accumulator
         self.pending_results: List[dict] = []
         self.pending_results_lock = threading.Lock()
-        self.last_batch_report_time = 0.0
 
     def elapsed(self):
         return self.config.now_fn() - self.start_time
@@ -462,24 +426,19 @@ class PollingAgent:
                 logger.warning(f"{description} attempt {attempt} failed ({e}); retrying in {delay:.1f}s")
                 self.config.sleep_fn(delay)
 
-    # ==================== V2: Batch Result Reporting ====================
-
     def _add_pending_result(self, result: dict):
-        """Add a result to the pending batch, report if threshold reached."""
         with self.pending_results_lock:
             self.pending_results.append(result)
             if len(self.pending_results) >= self.config.batch_report_threshold:
                 self._flush_pending_results_locked()
 
     def _flush_pending_results_locked(self):
-        """Flush pending results to coordinator (must hold pending_results_lock)."""
         if not self.pending_results:
             return
 
         results_to_send = self.pending_results[:]
         self.pending_results = []
 
-        # Release lock before network call
         def do_report():
             reported = self._call_with_retry(
                 lambda: self.client.report_results_batch(
@@ -491,39 +450,21 @@ class PollingAgent:
             )
             if reported is None:
                 logger.error(f"Failed to report batch of {len(results_to_send)} results")
-                # Re-queue failed results? For now, log and continue.
-                # In production, you might want to retry individually.
             else:
                 logger.info(f"Reported batch of {len(results_to_send)} results")
 
-        # Run reporting in a separate thread to not block the main loop
         t = threading.Thread(target=do_report, daemon=True)
         t.start()
 
     def _flush_pending_results(self):
-        """Public method to flush pending results."""
         with self.pending_results_lock:
             self._flush_pending_results_locked()
-
-    def _report_result_thread(self, worker_id, result):
-        """Legacy single-result reporting (kept for compatibility)."""
-        reported = self._call_with_retry(
-            lambda: self.client.report_result(worker_id, self.config.run_url, result),
-            "report_result",
-        )
-        if reported is None:
-            logger.error(f"Failed to report result for {result.get('job_id')}")
-        else:
-            logger.info(f"Reported result for {result.get('job_id')}")
-        with self.lock:
-            self.running_jobs -= 1
 
     def _process_job(self, worker_id, job):
         with self.lock:
             self.running_jobs += 1
         result = self.executor.execute(job)
         logger.info(f"Job {job.get('job_id')} finished with category {result.get('category')}")
-        # V2: Add to batch instead of reporting immediately
         self._add_pending_result(result)
         with self.lock:
             self.running_jobs -= 1
@@ -552,13 +493,11 @@ class PollingAgent:
                 registered = True
                 logger.info(f"Registered worker {self.config.worker_id}")
 
-            # V2: Use batch poll instead of single poll
             response = self._call_with_retry(
                 lambda: self.client.poll_batch(self.config.worker_id, self.config.run_url, self.config.batch_size),
                 "poll_batch",
             )
 
-            # Handle shutdown signal
             if isinstance(response, list) and len(response) == 1 and response[0].get("shutdown"):
                 logger.info("Shutdown signal received from coordinator. Exiting polling loop.")
                 should_shutdown = True
@@ -576,10 +515,8 @@ class PollingAgent:
         while (not self.job_queue.empty() or self.running_jobs > 0) and self.config.now_fn() < end_time:
             self.config.sleep_fn(1)
 
-        # Flush any remaining pending results before shutdown
         logger.info("Flushing remaining pending results...")
         self._flush_pending_results()
-        # Give the flush thread a moment to complete
         time.sleep(2)
 
         logger.info("Calling report_done and shutting down")
@@ -608,7 +545,6 @@ def parse_args():
     parser.add_argument("--poll-interval", type=float, default=10.0)
     parser.add_argument("--stop-polling-after", type=float, default=17700.0)
     parser.add_argument("--venv-pool-size", type=int, default=20)
-    # V2: Batch size argument
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--batch-report-threshold", type=int, default=10)
     return parser.parse_args()
