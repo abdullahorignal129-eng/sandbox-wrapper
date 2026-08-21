@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Linux worker agent for dataset_verification (with shutdown support)."""
-
 import argparse
-import base64
 import logging
 import os
 import queue
@@ -27,7 +25,6 @@ logger = logging.getLogger("worker_agent_linux")
 
 BASE_PATH = "/dataset_verification"
 MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", 1024 * 1024))
-MAX_FILESYSTEM_STATE_BYTES = int(os.environ.get("MAX_FILESYSTEM_STATE_BYTES", 5 * 1024 * 1024))  # 5MB default
 
 
 @dataclass
@@ -226,8 +223,8 @@ class JobExecutor:
                 file_path = root_path / filename
                 try:
                     file_size = file_path.stat().st_size
-                    if file_size > MAX_FILESYSTEM_STATE_BYTES:
-                        logger.debug(f"Skipping {file_path} ({file_size} bytes > {MAX_FILESYSTEM_STATE_BYTES} limit)")
+                    if file_size > int(os.environ.get("MAX_FILESYSTEM_STATE_BYTES", 5 * 1024 * 1024)):
+                        logger.debug(f"Skipping {file_path} (too large)")
                         continue
 
                     with open(file_path, 'rb') as f:
@@ -249,7 +246,6 @@ class JobExecutor:
         except Exception as e:
             logger.warning(f"Failed to snapshot workspace for {job.get('job_id')}: {e}")
             base_result["filesystem_state"] = {}
-
         return base_result
 
     def execute(self, job):
@@ -281,7 +277,7 @@ class JobExecutor:
         return self._run_with_interpreter(job, python_exe, install_deps=True)
 
     def _run_with_interpreter(self, job, python_exe, install_deps):
-        work_dir = Path(tempfile.mkdtemp(prefix="job_")).resolve()
+        work_dir = Path(tempfile.mkdtemp(prefix="job_"))
         try:
             for filename, content in job.get("files", {}).items():
                 fp = work_dir / filename
@@ -328,26 +324,20 @@ class JobExecutor:
             shutil.rmtree(work_dir, ignore_errors=True)
 
     def _infra_failure(self, job, reason):
-        return {
-            "job_id": job["job_id"], "stdout": "", "stderr": reason, "exit_code": 1,
-            "timed_out": False, "category": "infra_failure", "failure_reason": reason,
-            "network_activity_detected": None, "filesystem_state": {},
-        }
+        return {"job_id": job["job_id"], "stdout": "", "stderr": reason, "exit_code": 1,
+                "timed_out": False, "category": "infra_failure", "failure_reason": reason,
+                "network_activity_detected": None, "filesystem_state": {}}
 
     def _dependency_install_failure(self, job, reason):
-        return {
-            "job_id": job["job_id"], "stdout": "", "stderr": reason, "exit_code": 1,
-            "timed_out": False, "category": "dependency_install_failed", "failure_reason": reason,
-            "network_activity_detected": None, "filesystem_state": {},
-        }
+        return {"job_id": job["job_id"], "stdout": "", "stderr": reason, "exit_code": 1,
+                "timed_out": False, "category": "dependency_install_failed", "failure_reason": reason,
+                "network_activity_detected": None, "filesystem_state": {}}
 
     def _timeout_failure(self, job):
-        return {
-            "job_id": job["job_id"], "stdout": "", "stderr": "Timeout", "exit_code": -1,
-            "timed_out": True, "category": "timeout",
-            "failure_reason": f"Job timed out after {job.get('timeout', 15.0)}s",
-            "network_activity_detected": None, "filesystem_state": {},
-        }
+        return {"job_id": job["job_id"], "stdout": "", "stderr": "Timeout", "exit_code": -1,
+                "timed_out": True, "category": "timeout",
+                "failure_reason": f"Job timed out after {job.get('timeout', 15.0)}s",
+                "network_activity_detected": None, "filesystem_state": {}}
 
 
 class CoordinatorClient:
@@ -360,15 +350,6 @@ class CoordinatorClient:
                              json={"worker_id": worker_id, "url": url, "environment": environment})
         r.raise_for_status()
         return r.json()
-
-    def poll(self, worker_id, url):
-        r = self.client.post(f"{BASE_PATH}/worker/poll",
-                             json={"worker_id": worker_id, "url": url})
-        r.raise_for_status()
-        data = r.json()
-        if data.get("shutdown"):
-            return {"shutdown": True}
-        return data.get("job")
 
     def poll_batch(self, worker_id: int, url: str, batch_size: int = 50) -> List[dict]:
         try:
@@ -392,12 +373,6 @@ class CoordinatorClient:
             f"{BASE_PATH}/worker/results/batch",
             json={"worker_id": worker_id, "url": url, "results": results}
         )
-        r.raise_for_status()
-        return r.json()
-
-    def report_result(self, worker_id, url, result):
-        r = self.client.post(f"{BASE_PATH}/worker/result",
-                             params={"worker_id": worker_id, "url": url}, json=result)
         r.raise_for_status()
         return r.json()
 
@@ -519,11 +494,15 @@ class PollingAgent:
                 logger.info("Shutdown signal received from coordinator. Exiting polling loop.")
                 should_shutdown = True
                 break
-            elif isinstance(response, list) and response:
+            elif response:
                 logger.info(f"Queued {len(response)} jobs from batch")
                 for job in response:
                     self.job_queue.put(job)
             else:
+                # V2 FIX: If no new jobs, check if we have pending results to flush immediately
+                with self.pending_results_lock:
+                    if self.pending_results:
+                        self._flush_pending_results_locked()
                 self.config.sleep_fn(self.config.poll_interval)
 
         logger.info("Stop polling threshold reached or shutdown requested; waiting for running jobs to finish...")
